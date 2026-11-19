@@ -1,0 +1,4194 @@
+import logo from './logo.png'
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
+import Heatmap from "./components/Heatmap/Heatmap";
+import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Legend } from 'recharts';
+import {
+  buildPbpFilterQuery,
+  canApplyPbpAdvancedFilters,
+  DEFAULT_PBP_ADVANCED_FILTERS,
+  normalizeClockInput,
+  pbpAdvancedFiltersEqual,
+  validatePbpAdvancedFilters,
+} from "./pbpFilters";
+import { evidenceLabel, resolveEvidenceTarget } from "./evidenceNavigation";
+
+function CollapseButton({ panelRef, collapsed, onCollapsedChange, title }) {
+  return (
+    <button
+      type="button"
+      className="collapse-btn"
+      onClick={() => {
+        if (collapsed) {
+          panelRef.current?.expand();
+          onCollapsedChange?.(false);
+        } else {
+          panelRef.current?.collapse();
+          onCollapsedChange?.(true);
+        }
+      }}
+      title={collapsed ? `Expand ${title}` : `Collapse ${title}`}
+      aria-label={collapsed ? `Expand ${title}` : `Collapse ${title}`}
+    >
+      {collapsed ? "◀" : "▶"}
+    </button>
+  );
+}
+
+function getApiBase() {
+  if (import.meta.env.VITE_API_BASE_URL) {
+    return import.meta.env.VITE_API_BASE_URL;
+  }
+  if (
+    typeof window !== "undefined" &&
+    window.location.hostname === "localhost" &&
+    window.location.port !== "8000"
+  ) {
+    return "http://localhost:8000";
+  }
+  return "";
+}
+
+const API_BASE = getApiBase();
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
+const PROFILE_STORAGE_KEY = "basketball-live-analytics-profile";
+
+const UCSB_TEAM_ID = "2540";
+const PBP_TEAM_ID = "pbp";
+const HIDDEN_COLUMNS = new Set(["row_key"]);
+const TRENDS_STAT_THRESHOLDS_TEAM = [
+  { stat_key: "points", value: 1.8 },
+  { stat_key: "field_goals_made", value: 0.65 },
+  { stat_key: "three_pointers_made", value: 0.19 },
+  { stat_key: "free_throws_made", value: 0.33 },
+  { stat_key: "rebounds", value: 0.9 },
+  { stat_key: "offensive_rebounds", value: 0.25 },
+  { stat_key: "defensive_rebounds", value: 0.65 },
+  { stat_key: "assists", value: 0.38 },
+  { stat_key: "steals", value: 0.18 },
+  { stat_key: "blocks", value: 0.1 },
+  { stat_key: "turnovers", value: 0.3 },
+  { stat_key: "fouls", value: 0.43 },
+];
+
+const TRENDS_STAT_THRESHOLDS_PLAYER = [
+  { stat_key: "points", value: 0.4 },
+  { stat_key: "field_goals_made", value: 0.15 },
+  { stat_key: "three_pointers_made", value: 0.044 },
+  { stat_key: "free_throws_made", value: 0.068 },
+  { stat_key: "rebounds", value: 0.16 },
+  { stat_key: "offensive_rebounds", value: 0.048 },
+  { stat_key: "defensive_rebounds", value: 0.112 },
+  { stat_key: "assists", value: 0.08 },
+  { stat_key: "steals", value: 0.032 },
+  { stat_key: "blocks", value: 0.02 },
+  { stat_key: "turnovers", value: 0.06 },
+  { stat_key: "fouls", value: 0.1 },
+];
+
+const BIG_WEST_TEAM_IDS = new Set([
+  "2540", // UC Santa Barbara
+  "300",  // UC Irvine
+  "27",   // UC Riverside
+  "28",   // UC San Diego
+  "302",  // UC Davis
+  "13",   // Cal Poly
+  "304",  // CSU Bakersfield
+  "305",  // CSU Fullerton
+  "306",  // CSUN
+  "299",  // Long Beach State
+  "62",   // Hawaii
+  "ucsb", "uci", "ucr", "ucsd", "ucd", "calpoly", "csub", "csuf", "csun", "lbsu", "hawaii"
+]);
+
+function decodeJwtPayload(token) {
+  const payload = token.split(".")[1];
+  if (!payload) {
+    throw new Error("Missing Google credential payload");
+  }
+  const normalizedPayload = payload
+    .replace(/-/g, "+")
+    .replace(/_/g, "/")
+    .padEnd(Math.ceil(payload.length / 4) * 4, "=");
+  const decodedPayload = atob(normalizedPayload);
+  const jsonPayload = decodedPayload
+    .split("")
+    .map((char) => `%${char.charCodeAt(0).toString(16).padStart(2, "0")}`)
+    .join("");
+  return JSON.parse(decodeURIComponent(jsonPayload));
+}
+
+function getStoredProfile() {
+  try {
+    const storedProfile = localStorage.getItem(PROFILE_STORAGE_KEY);
+    return storedProfile ? JSON.parse(storedProfile) : null;
+  } catch {
+    return null;
+  }
+}
+
+function setStoredProfile(profile) {
+  try {
+    if (profile) {
+      localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(profile));
+    } else {
+      localStorage.removeItem(PROFILE_STORAGE_KEY);
+    }
+  } catch {
+    // Local storage is optional for the UI; ignore private browsing failures.
+  }
+}
+
+const DEFAULT_TABLE_STATE = {
+  filter: "",
+  sortColumn: "",
+  sortDirection: "asc",
+  selectedRowKey: "",
+  forcedRowKey: "",
+  highlightRowKey: "",
+};
+
+function normalizeTeamIdInput(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "")
+    .replace(/^-+|-+$/g, "");
+}
+
+function comparableValue(value) {
+  const normalized = String(value ?? "").trim();
+  const numeric = Number(normalized.replace(/,/g, "").replace(/%/g, ""));
+  if (!Number.isNaN(numeric) && normalized !== "") {
+    return { type: "number", value: numeric };
+  }
+  return { type: "string", value: normalized.toLowerCase() };
+}
+
+function PlayerPerformanceStory({ playerTimeline, teamName, seasonAvg }) {
+  const [activeStat, setActiveStat] = useState("points");
+
+  if (!playerTimeline || !playerTimeline.stats) {
+    return (
+      <div className="placeholder" style={{ padding: "40px", textAlign: "center" }}>
+        Select a player to visualize their game impact.
+      </div>
+    );
+  }
+
+  const statEntry = playerTimeline.stats.find((s) => s.stat_key === activeStat);
+  const chartData = [
+    { time: 0, total: 0, displayTime: "0:00" },
+    ...(statEntry?.events || []).map((event) => ({
+      time: event.timestamp || 0,
+      total: event.total || 0,
+      displayTime: `${event.period}H ${Math.floor(event.timestamp / 60)}:${String(
+        event.timestamp % 60,
+      ).padStart(2, "0")}`,
+    })),
+  ];
+
+  const CustomTooltip = ({ active, payload }) => {
+    if (active && payload && payload.length) {
+      return (
+        <div className="custom-tooltip">
+          <span className="label">{payload[0].payload.displayTime}</span>
+          <span className="value">
+            {payload[0].value} {activeStat.toUpperCase()}
+          </span>
+        </div>
+      );
+    }
+    return null;
+  };
+
+  return (
+    <div className="player-story-card">
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "flex-start",
+          marginBottom: "24px",
+        }}
+      >
+        <div>
+          <h3
+            style={{
+              margin: 0,
+              fontSize: "1.2rem",
+              fontWeight: 800,
+              color: "var(--ink)",
+            }}
+          >
+            {playerTimeline.player_name}
+          </h3>
+          <span
+            style={{ color: "var(--muted)", fontSize: "0.85rem", fontWeight: 500 }}
+          >
+            {teamName}
+          </span>
+        </div>
+        <select
+          value={activeStat}
+          onChange={(e) => setActiveStat(e.target.value)}
+          className="stat-selector"
+          style={{
+            padding: "6px 12px",
+            borderRadius: "10px",
+            background: "var(--panel-strong)",
+          }}
+        >
+          <option value="points">Points</option>
+          <option value="rebounds">Rebounds</option>
+          <option value="assists">Assists</option>
+        </select>
+      </div>
+      <div style={{ width: "100%", height: 280 }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={chartData}>
+            <defs>
+              <linearGradient id="colorStat" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%" stopColor="var(--accent)" stopOpacity={0.3} />
+                <stop offset="95%" stopColor="var(--accent)" stopOpacity={0} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid
+              strokeDasharray="3 3"
+              vertical={false}
+              stroke="rgba(0,0,0,0.05)"
+            />
+            <XAxis dataKey="time" hide />
+            <YAxis
+              axisLine={false}
+              tickLine={false}
+              tick={{ fill: "var(--muted)", fontSize: 11 }}
+              allowDecimals={false}
+            />
+            <Tooltip content={<CustomTooltip />} />
+
+            {seasonAvg && (
+              <ReferenceLine
+                y={seasonAvg}
+                stroke="var(--warning)"
+                strokeDasharray="5 5"
+                label={{
+                  position: "right",
+                  value: "Season Avg",
+                  fill: "var(--warning)",
+                  fontSize: 10,
+                }}
+              />
+            )}
+
+            <Area
+              type="monotone"
+              dataKey="total"
+              stroke="var(--accent)"
+              strokeWidth={3}
+              fillOpacity={1}
+              fill="url(#colorStat)"
+              animationDuration={1200}
+            />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+      <div style={{ marginTop: "16px", display: "flex", gap: "12px" }}>
+        <div className="stat-summary-chip">
+          <span
+            style={{
+              fontSize: "0.7rem",
+              color: "var(--muted)",
+              textTransform: "uppercase",
+            }}
+          >
+            Current Total
+          </span>
+          <div style={{ fontSize: "1.1rem", fontWeight: 700 }}>
+            {chartData[chartData.length - 1].total}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TeamPieComparison({ liveStats, teamName }) {
+  const chartData = useMemo(() => {
+    return (liveStats?.rows || [])
+      .map((row) => ({
+        name: row.Player,
+        pie: parseFloat(row.PIE) || 0,
+      }))
+      .sort((a, b) => b.pie - a.pie);
+  }, [liveStats]);
+
+  return (
+    <div className="player-story-card" style={{ height: "100%", padding: "20px" }}>
+      <h3 style={{ margin: "0 0 20px 0", fontSize: "1.1rem", fontWeight: 800 }}>
+        {teamName} Impact Efficiency (PIE)
+      </h3>
+      <div style={{ width: "100%", height: 400 }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={chartData} layout="vertical" margin={{ left: 20, right: 30 }}>
+            <CartesianGrid
+              strokeDasharray="3 3"
+              horizontal={true}
+              vertical={false}
+              stroke="rgba(0,0,0,0.05)"
+            />
+            <XAxis type="number" domain={[0, "auto"]} hide />
+            <YAxis
+              dataKey="name"
+              type="category"
+              width={120}
+              tick={{ fill: "var(--ink)", fontSize: 11, fontWeight: 600 }}
+            />
+            <Tooltip
+              formatter={(value) => [`${value.toFixed(1)}%`, "PIE"]}
+              contentStyle={{
+                borderRadius: "8px",
+                border: "none",
+                boxShadow: "0 4px 12px rgba(0,0,0,0.1)",
+                backgroundColor: "rgba(0, 54, 96, 0.95)",
+                color: "var(--ink)"
+              }}
+            />
+            <Bar dataKey="pie" fill="var(--accent)" radius={[0, 4, 4, 0]} barSize={20} />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
+async function fetchJson(url, options = {}, retries = 0) {
+  let attempt = 0;
+  while (true) {
+    try {
+      const response = await fetch(url, options);
+      const json = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(json.error || `Request failed (${response.status})`);
+      }
+      return json;
+    } catch (error) {
+      if (attempt >= retries) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+      attempt += 1;
+    }
+  }
+}
+
+function collectTrendIncrements(row) {
+  const increments = {};
+  const playType = String(row.type || "");
+  const text = String(row.text || "").toLowerCase();
+  const scoringPlay = Boolean(row.scoring_play);
+  const shootingPlay = Boolean(row.shooting_play);
+  const scoreValue = Number(row.score_value || 0);
+  const pointsAttempted = Number(row.points_attempted || 0);
+  const assistId = String(row.assist_athlete_id || "").trim();
+
+  if (scoringPlay && scoreValue > 0) increments.points = scoreValue;
+  if (shootingPlay && (pointsAttempted === 2 || pointsAttempted === 3)) {
+    increments.field_goals_attempted = 1;
+    if (pointsAttempted === 2) increments.two_pointers_attempted = 1;
+    if (pointsAttempted === 3) increments.three_pointers_attempted = 1;
+  }
+  if (scoringPlay && (scoreValue === 2 || scoreValue === 3)) {
+    increments.field_goals_made = 1;
+    if (scoreValue === 2) increments.two_pointers_made = 1;
+    if (scoreValue === 3) increments.three_pointers_made = 1;
+  }
+  if (text.includes("free throw")) {
+    increments.free_throws_attempted = 1;
+    if (scoringPlay && scoreValue === 1) increments.free_throws_made = 1;
+  }
+  if (playType === "Offensive Rebound") {
+    increments.offensive_rebounds = 1;
+    increments.rebounds = 1;
+  } else if (playType === "Defensive Rebound") {
+    increments.defensive_rebounds = 1;
+    increments.rebounds = 1;
+  }
+  if (playType === "Steal") increments.steals = 1;
+  if (playType === "Block Shot") increments.blocks = 1;
+  if (playType.toLowerCase().includes("turnover")) increments.turnovers = 1;
+  if (playType.toLowerCase().includes("foul")) increments.fouls = 1;
+  if (assistId && scoringPlay) increments.assists = 1;
+  return increments;
+}
+
+function normalizeTrendPeriod(periodValue) {
+  const raw = String(periodValue || "")
+    .toLowerCase()
+    .trim();
+  if (!raw) return "2";
+  if (
+    raw.includes("1") ||
+    raw.includes("first") ||
+    raw === "1h" ||
+    raw === "1st"
+  ) {
+    return "1";
+  }
+  return "2";
+}
+
+function getPointsFromPbp(row) {
+  const text = String(row.text || "").toLowerCase();
+  const playType = String(row.type || "").toLowerCase();
+  const actorId = String(row.athlete_id || "").trim();
+
+  if (!actorId) return 0;
+  if (text.includes("miss")) return 0;
+
+  if (playType === "madefreethrow" || /makes .*free throw/.test(text)) {
+    return 1;
+  }
+
+  if (
+    /makes .*three point/.test(text) ||
+    /makes .*three pointer/.test(text) ||
+    /makes .*3-pt/.test(text) ||
+    /makes .*3pt/.test(text)
+  ) {
+    return 3;
+  }
+
+  if (text.includes("makes")) {
+    return 2;
+  }
+
+  return 0;
+}
+
+
+function buildCustomPlayerTimeline(rows, playerId, playerName, teamId) {
+  if (!playerId || !rows || rows.length === 0) return null;
+
+  let totalPoints = 0;
+  let totalRebounds = 0;
+  let totalAssists = 0;
+  const pointEvents = [];
+  const reboundEvents = [];
+  const assistEvents = [];
+
+  rows.forEach((row) => {
+    const rowActorId = String(row.athlete_id || "").trim();
+    const rowAssistId = String(row.assist_athlete_id || "").trim();
+    const timestamp = halfTimestampSeconds(row);
+    const period = normalizeTrendPeriod(row.period);
+
+    if (rowActorId === String(playerId)) {
+      // Points
+      const pts = getPointsFromPbp(row);
+      if (pts > 0) {
+        totalPoints += pts;
+        pointEvents.push({ timestamp, period, increment: pts, total: totalPoints });
+      }
+
+      // Rebounds
+      const playType = String(row.type || "");
+      if (playType === "Offensive Rebound" || playType === "Defensive Rebound") {
+        totalRebounds += 1;
+        reboundEvents.push({ timestamp, period, increment: 1, total: totalRebounds });
+      }
+    }
+
+    if (rowAssistId === String(playerId) && Boolean(row.scoring_play)) {
+      totalAssists += 1;
+      assistEvents.push({ timestamp, period, increment: 1, total: totalAssists });
+    }
+  });
+
+  return {
+    player_name: playerName || "Selected Player",
+    team_id: teamId || "",
+    stats: [
+      { stat_key: "points", events: pointEvents },
+      { stat_key: "rebounds", events: reboundEvents },
+      { stat_key: "assists", events: assistEvents },
+    ],
+  };
+}
+
+function getStatEvents(playerTimeline, statKey) {
+  return (
+    playerTimeline?.stats?.find((stat) => stat.stat_key === statKey)?.events || []
+  );
+}
+
+function buildWarTimeline(p1Timeline, p2Timeline, player1Name, player2Name) {
+  if (!p1Timeline || !p2Timeline) {
+    return null;
+  }
+  const statKeys = ["points", "rebounds", "assists"];
+  const comparisonStats = statKeys.map((statKey) => {
+    const p1Events = getStatEvents(p1Timeline, statKey);
+    const p2Events = getStatEvents(p2Timeline, statKey);
+    const combinedEvents = [
+      ...p1Events.map((event) => ({
+        ...event,
+        playerKey: "playerOne",
+      })),
+      ...p2Events.map((event) => ({
+        ...event,
+        playerKey: "playerTwo",
+      })),
+    ];
+
+    combinedEvents.sort((a, b) => {
+      const aPeriod = Number(a.period || 0);
+      const bPeriod = Number(b.period || 0);
+
+      if (aPeriod !== bPeriod) {
+        return aPeriod - bPeriod;
+      }
+      return Number(a.timestamp || 0) - Number(b.timestamp || 0);
+    });
+
+    let p1Total = 0;
+    let p2Total = 0;
+    const diffEvents = combinedEvents.map((event) => {
+      const increment = Number(event.increment || 0);
+      if (event.playerKey === "playerOne") {
+        p1Total += increment;
+      } else {
+        p2Total += increment;
+      }
+      return {
+        timestamp: event.timestamp,
+        period: event.period,
+        increment: event.playerKey === "playerOne" ? increment : -increment,
+        total: p1Total - p2Total,
+        p1Total,
+        p2Total
+      };
+    });
+
+    return {
+      stat_key: statKey,
+      events: diffEvents,
+    };
+  });
+
+  return {
+    player_name: `${player1Name || "Player 1"} vs ${player2Name || "Player 2"}`,
+    team_id: "",
+    stats: comparisonStats,
+  };
+
+}
+
+// ── Score Differential helpers ──
+function pbpRowToGameMin(row) {
+  const clockStr = String(row.clock || "").trim();
+  const m = clockStr.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const minsRemaining = Number(m[1]) + Number(m[2]) / 60;
+  const period = String(row.period || "").toLowerCase();
+  if (period.includes("1st") || period === "1") return +(20 - minsRemaining).toFixed(3);
+  if (period.includes("2nd") || period === "2") return +(40 - minsRemaining).toFixed(3);
+  if (period.includes("ot") || period.includes("overtime")) return +(45 - minsRemaining).toFixed(3);
+  return null;
+}
+
+function ScoreDiffTooltip({ active, payload, ucsbName, opponentName }) {
+  if (!active || !payload?.length) return null;
+  const d = payload[0]?.payload;
+  if (!d) return null;
+  const leading = d.diff >= 0
+    ? { name: ucsbName, color: "#16a34a" }
+    : { name: opponentName, color: "#b03020" };
+  return (
+    <div className="custom-tooltip">
+      <span className="label">{d.label}</span>
+      <div style={{ display: "flex", gap: 12, marginTop: 4 }}>
+        <span style={{ fontSize: "0.85rem" }}>{ucsbName}: <strong>{d.ucsb}</strong></span>
+        <span style={{ fontSize: "0.85rem" }}>{opponentName}: <strong>{d.opp}</strong></span>
+      </div>
+      <div className="value" style={{ color: leading.color }}>
+        {d.diff >= 0 ? `${ucsbName} +${d.diff}` : `${opponentName} +${Math.abs(d.diff)}`}
+      </div>
+    </div>
+  );
+}
+
+function ScoreDifferentialChart({ rows, ucsbTeamId, ucsbName, opponentName }) {
+  const data = useMemo(() => {
+    if (!rows?.length) return [];
+
+    // Detect whether UCSB is home or away
+    let ucsbIsHome = null;
+    for (let i = 1; i < rows.length; i++) {
+      const row = rows[i];
+      const rowTeamId = String(row.team_id || "").trim().toLowerCase();
+      const targetTeamId = String(ucsbTeamId).trim().toLowerCase();
+      const isUcsb = rowTeamId === targetTeamId || rowTeamId === "ucsb" || rowTeamId === "2540";
+      if (!row.scoring_play || !isUcsb) continue;
+      const prev = rows[i - 1];
+      if (row.home_score > prev.home_score) { ucsbIsHome = true; break; }
+      if (row.away_score > prev.away_score) { ucsbIsHome = false; break; }
+    }
+    if (ucsbIsHome === null) ucsbIsHome = true;
+
+    const points = [{ gameMin: 0, label: "Tip-off", ucsb: 0, opp: 0, diff: 0, ucsbLead: 0, oppLead: 0 }];
+    for (const row of rows) {
+      if (!row.scoring_play) continue;
+      const gameMin = pbpRowToGameMin(row);
+      if (gameMin === null) continue;
+      const ucsb = ucsbIsHome ? (row.home_score ?? 0) : (row.away_score ?? 0);
+      const opp  = ucsbIsHome ? (row.away_score ?? 0) : (row.home_score ?? 0);
+      const diff = ucsb - opp;
+      points.push({
+        gameMin,
+        label: `${row.period} — ${row.clock}`,
+        ucsb, opp, diff,
+        ucsbLead: diff >= 0 ? diff : 0,
+        oppLead:  diff <  0 ? diff : 0,
+      });
+    }
+    return points;
+  }, [rows, ucsbTeamId]);
+
+  const maxMin = data.length ? Math.ceil(data[data.length - 1].gameMin) : 40;
+  const ticks = maxMin <= 40 ? [0, 10, 20, 30, 40] : [0, 10, 20, 30, 40, maxMin];
+
+  if (!data.length) {
+    return <p className="placeholder" style={{ padding: 16 }}>No scoring play data available.</p>;
+  }
+
+  return (
+    <div style={{ padding: "16px 16px 8px" }}>
+      <ResponsiveContainer width="100%" height={320}>
+        <AreaChart data={data} margin={{ top: 12, right: 24, left: 8, bottom: 0 }}>
+          <defs>
+            <linearGradient id="ucsbGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%"  stopColor="#16a34a" stopOpacity={0.65} />
+              <stop offset="95%" stopColor="#16a34a" stopOpacity={0.05} />
+            </linearGradient>
+            <linearGradient id="oppGrad" x1="0" y1="1" x2="0" y2="0">
+              <stop offset="5%"  stopColor="#b03020" stopOpacity={0.65} />
+              <stop offset="95%" stopColor="#b03020" stopOpacity={0.05} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid strokeDasharray="3 3" stroke="#c0d8ed" />
+          <XAxis
+            dataKey="gameMin"
+            type="number"
+            domain={[0, maxMin]}
+            ticks={ticks}
+            tickFormatter={v => `${v}m`}
+            label={{ value: "Game time (min)", position: "insideBottom", offset: -2, fontSize: 11 }}
+          />
+          <YAxis tickFormatter={v => v > 0 ? `+${v}` : String(v)} width={38} />
+          <Tooltip content={<ScoreDiffTooltip ucsbName={ucsbName} opponentName={opponentName} />} />
+          <ReferenceLine y={0} stroke="#555" strokeWidth={2} />
+          <ReferenceLine x={20} stroke="#aaa" strokeDasharray="5 4" label={{ value: "Half", position: "insideTopRight", fontSize: 10 }} />
+          <Legend
+            formatter={(value) => value === "ucsbLead" ? ucsbName : opponentName}
+            wrapperStyle={{ fontSize: "0.82rem", paddingTop: 8 }}
+          />
+          <Area type="monotone" dataKey="ucsbLead" stroke="#16a34a" strokeWidth={2} fill="url(#ucsbGrad)" dot={false} activeDot={{ r: 4 }} />
+          <Area type="monotone" dataKey="oppLead"  stroke="#b03020" strokeWidth={2} fill="url(#oppGrad)"  dot={false} activeDot={{ r: 4 }} />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function parseClockRemainingSeconds(clockValue) {
+  const raw = String(clockValue || "").trim();
+  const match = raw.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+  const minutes = Number(match[1]);
+  const seconds = Number(match[2]);
+  if (Number.isNaN(minutes) || Number.isNaN(seconds) || seconds > 59) {
+    return null;
+  }
+  return minutes * 60 + seconds;
+}
+
+function halfTimestampSeconds(row) {
+  const HALF_LENGTH_SECONDS = 20 * 60;
+  const remaining = parseClockRemainingSeconds(row.clock);
+  if (remaining === null) return 0;
+  const elapsed = HALF_LENGTH_SECONDS - remaining;
+  if (elapsed < 0) return 0;
+  if (elapsed > HALF_LENGTH_SECONDS) return HALF_LENGTH_SECONDS;
+  return elapsed;
+}
+
+function formatHalfRemainingClock(elapsedSeconds) {
+  const HALF_LENGTH_SECONDS = 20 * 60;
+  const safeElapsed = Math.max(
+    0,
+    Math.min(HALF_LENGTH_SECONDS, elapsedSeconds),
+  );
+  const remaining = HALF_LENGTH_SECONDS - safeElapsed;
+  const minutes = Math.floor(remaining / 60);
+  const seconds = remaining % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function deriveTrendsCheckpoint(rows) {
+  const fallback = {
+    currentHalf: "1",
+    currentTimestamp: 10 * 60,
+    label: "1st Half 10:00",
+  };
+  if (!Array.isArray(rows) || !rows.length) {
+    return fallback;
+  }
+
+  let latest = null;
+  for (const row of rows) {
+    const currentHalf = normalizeTrendPeriod(row?.period);
+    const halfRank = Number(currentHalf || 0);
+    const currentTimestamp = halfTimestampSeconds(row);
+    if (
+      !latest ||
+      halfRank > latest.halfRank ||
+      (halfRank === latest.halfRank &&
+        currentTimestamp > latest.currentTimestamp)
+    ) {
+      const rawPeriod = String(row?.period || "").trim();
+      const periodLabel =
+        rawPeriod || (currentHalf === "1" ? "1st Half" : "2nd Half");
+      const rawClock = String(row?.clock || "").trim();
+      latest = {
+        halfRank,
+        currentHalf,
+        currentTimestamp,
+        label: `${periodLabel} ${rawClock || formatHalfRemainingClock(currentTimestamp)}`,
+      };
+    }
+  }
+
+  if (!latest) {
+    return fallback;
+  }
+  return {
+    currentHalf: latest.currentHalf,
+    currentTimestamp: latest.currentTimestamp,
+    label: latest.label,
+  };
+}
+
+function buildTrendsAnalyticsTimelines(rows) {
+  const perTeamTotals = {};
+  const perTeamStats = {};
+
+  rows.forEach((row) => {
+    const rawTeamId = String(row.team_id || "").trim();
+    if (!rawTeamId) return;
+    const normalizedTeamId = normalizeTeamIdInput(rawTeamId);
+    let teamId = normalizedTeamId;
+    if (normalizedTeamId === "ucsb" || normalizedTeamId === UCSB_TEAM_ID) {
+      teamId = UCSB_TEAM_ID;
+    } else if (normalizedTeamId === "opponent") {
+      teamId = "opponent";
+    }
+    if (!teamId) return;
+    const increments = collectTrendIncrements(row);
+    const statKeys = Object.keys(increments);
+    if (!statKeys.length) return;
+    if (!perTeamTotals[teamId]) perTeamTotals[teamId] = {};
+    if (!perTeamStats[teamId]) perTeamStats[teamId] = {};
+
+    statKeys.forEach((statKey) => {
+      const increment = Number(increments[statKey] || 0);
+      if (increment <= 0) return;
+      const total = Number(perTeamTotals[teamId][statKey] || 0) + increment;
+      perTeamTotals[teamId][statKey] = total;
+      if (!perTeamStats[teamId][statKey]) perTeamStats[teamId][statKey] = [];
+      const timestamp = halfTimestampSeconds(row);
+      perTeamStats[teamId][statKey].push({
+        timestamp,
+        period: normalizeTrendPeriod(row.period),
+        increment,
+        total,
+      });
+    });
+  });
+
+  const out = {};
+  Object.entries(perTeamStats).forEach(([teamId, statMap]) => {
+    out[teamId] = Object.entries(statMap).map(([statKey, events]) => ({
+      stat_key: statKey,
+      events,
+    }));
+  });
+  return out;
+}
+
+function buildTrendsPlayerAnalyticsTimelines(rows, playerNameById = {}) {
+  const perPlayerTotals = {};
+  const perPlayerStats = {};
+  const perPlayerTeam = {};
+
+  rows.forEach((row) => {
+    const rawTeamId = String(row.team_id || "").trim();
+    const normalizedTeamId = normalizeTeamIdInput(rawTeamId);
+    const teamId =
+      normalizedTeamId === "ucsb" || normalizedTeamId === UCSB_TEAM_ID
+        ? UCSB_TEAM_ID
+        : normalizedTeamId === "opponent"
+          ? "opponent"
+          : normalizedTeamId;
+
+    const actorId = String(row.athlete_id || "").trim();
+    const assistId = String(row.assist_athlete_id || "").trim();
+    const actorIncrements = collectTrendIncrements(row);
+    const perPlayerIncrements = {};
+
+    if (actorId) {
+      perPlayerIncrements[actorId] = { ...actorIncrements };
+      delete perPlayerIncrements[actorId].assists;
+      if (teamId) {
+        perPlayerTeam[actorId] = teamId;
+      }
+    }
+    if (assistId && row.scoring_play) {
+      if (!perPlayerIncrements[assistId]) {
+        perPlayerIncrements[assistId] = {};
+      }
+      perPlayerIncrements[assistId].assists =
+        Number(perPlayerIncrements[assistId].assists || 0) + 1;
+      if (teamId && !perPlayerTeam[assistId]) {
+        perPlayerTeam[assistId] = teamId;
+      }
+    }
+
+    Object.entries(perPlayerIncrements).forEach(([playerId, increments]) => {
+      const statKeys = Object.keys(increments);
+      if (!statKeys.length) return;
+      if (!perPlayerTotals[playerId]) perPlayerTotals[playerId] = {};
+      if (!perPlayerStats[playerId]) perPlayerStats[playerId] = {};
+
+      statKeys.forEach((statKey) => {
+        const increment = Number(increments[statKey] || 0);
+        if (increment <= 0) return;
+        const total =
+          Number(perPlayerTotals[playerId][statKey] || 0) + increment;
+        perPlayerTotals[playerId][statKey] = total;
+        if (!perPlayerStats[playerId][statKey])
+          perPlayerStats[playerId][statKey] = [];
+        perPlayerStats[playerId][statKey].push({
+          timestamp: halfTimestampSeconds(row),
+          period: normalizeTrendPeriod(row.period),
+          increment,
+          total,
+        });
+      });
+    });
+  });
+
+  const out = {};
+  Object.entries(perPlayerStats).forEach(([playerId, statMap]) => {
+    out[playerId] = {
+      player_name: playerNameById[playerId] || `Player ${playerId}`,
+      team_id: perPlayerTeam[playerId] || "",
+      stats: Object.entries(statMap).map(([statKey, events]) => ({
+        stat_key: statKey,
+        events,
+      })),
+    };
+  });
+  return out;
+}
+
+function trendsStatLabel(statKey) {
+  return String(statKey || "")
+    .replace(/_/g, " ")
+    .trim();
+}
+
+function buildTrendsMessages({
+  teamTimelines,
+  playerTimelines,
+  teamNameById,
+  overMultiplier,
+  underMultiplier,
+  currentHalf,
+  currentTimestamp,
+}) {
+  const thresholdByStat = Object.fromEntries(
+    TRENDS_STAT_THRESHOLDS_TEAM.map((threshold) => [
+      threshold.stat_key,
+      threshold,
+    ]),
+  );
+  const thresholdByPlayerStat = Object.fromEntries(
+    TRENDS_STAT_THRESHOLDS_PLAYER.map((threshold) => [
+      threshold.stat_key,
+      threshold,
+    ]),
+  );
+  const effectiveHalf = currentHalf || "1";
+  const effectiveTimestamp =
+    typeof currentTimestamp === "number" && currentTimestamp >= 0
+      ? currentTimestamp
+      : 10 * 60;
+  const MAX_WINDOW_MINUTES = Math.floor(effectiveTimestamp / 60);
+  const messages = [];
+  const playerMessages = [];
+
+  for (const [teamId, stats] of Object.entries(teamTimelines || {})) {
+    const teamLabel =
+      teamId === UCSB_TEAM_ID
+        ? "UCSB"
+        : teamId === "opponent"
+          ? "Opponent"
+          : teamNameById[teamId] || teamId || "Opponent";
+
+    for (const statEntry of stats) {
+      const statKey = String(statEntry.stat_key || "");
+      const threshold = thresholdByStat[statKey];
+      if (!threshold) {
+        continue;
+      }
+      const nationalAverage = Number(threshold.value || 0);
+      if (nationalAverage <= 0) {
+        continue;
+      }
+      const overThreshold = nationalAverage * overMultiplier;
+      const underThreshold = nationalAverage * underMultiplier;
+      const events = (statEntry.events || [])
+        .filter(
+          (event) =>
+            event.period === effectiveHalf &&
+            typeof event.timestamp === "number" &&
+            event.timestamp <= effectiveTimestamp,
+        )
+        .sort((left, right) => left.timestamp - right.timestamp);
+      if (!events.length) {
+        continue;
+      }
+
+      let bestOverMinutes = 0;
+      let bestOverTotal = 0;
+      let bestUnderMinutes = 0;
+      let bestUnderTotal = 0;
+      for (let minutes = 3; minutes <= MAX_WINDOW_MINUTES; minutes += 1) {
+        const windowStart = effectiveTimestamp - minutes * 60;
+        let total = 0;
+        for (const event of events) {
+          if (event.timestamp > windowStart) {
+            total += Number(event.increment || 0);
+          }
+        }
+        const rate = total / minutes;
+        const isOver = rate >= overThreshold;
+        const isUnder = rate <= underThreshold;
+        if (isOver && minutes > bestOverMinutes) {
+          bestOverMinutes = minutes;
+          bestOverTotal = total;
+        }
+        if (isUnder && minutes > bestUnderMinutes) {
+          bestUnderMinutes = minutes;
+          bestUnderTotal = total;
+        }
+      }
+
+      if (bestOverMinutes && bestOverTotal >= 3) {
+        if (statKey === "points") {
+          messages.push({
+            text: `${teamLabel} has scored ${bestOverTotal} points in the last ${bestOverMinutes} minutes.`,
+            tone: "good",
+          });
+        } else {
+          messages.push({
+            text: `${teamLabel} has ${bestOverTotal} ${trendsStatLabel(statKey)} in the last ${bestOverMinutes} minutes.`,
+            tone: "good",
+          });
+        }
+      }
+
+      if (bestUnderMinutes) {
+        if (statKey === "points") {
+          messages.push({
+            text: `${teamLabel} has scored ${bestUnderTotal} points in the last ${bestUnderMinutes} minutes.`,
+            tone: "bad",
+          });
+        } else {
+          messages.push({
+            text: `${teamLabel} has ${bestUnderTotal} ${trendsStatLabel(statKey)} in the last ${bestUnderMinutes} minutes.`,
+            tone: "bad",
+          });
+        }
+      }
+    }
+  }
+
+  for (const [playerId, playerData] of Object.entries(playerTimelines || {})) {
+    const teamId = String(playerData.team_id || "");
+    const teamLabel =
+      teamId === UCSB_TEAM_ID
+        ? "UCSB"
+        : teamId === "opponent"
+          ? "Opponent"
+          : teamNameById[teamId] || teamId || "";
+    const playerLabel = `${playerData.player_name || `Player ${playerId}`}${teamLabel ? ` (${teamLabel})` : ""}`;
+
+    for (const statEntry of playerData.stats || []) {
+      const statKey = String(statEntry.stat_key || "");
+      const threshold = thresholdByPlayerStat[statKey];
+      if (!threshold) {
+        continue;
+      }
+      const nationalAverage = Number(threshold.value || 0);
+      if (nationalAverage <= 0) {
+        continue;
+      }
+      const overThreshold = nationalAverage * overMultiplier;
+      const events = (statEntry.events || [])
+        .filter(
+          (event) =>
+            event.period === effectiveHalf &&
+            typeof event.timestamp === "number" &&
+            event.timestamp <= effectiveTimestamp,
+        )
+        .sort((left, right) => left.timestamp - right.timestamp);
+      if (!events.length) {
+        continue;
+      }
+
+      let bestOverMinutes = 0;
+      let bestOverTotal = 0;
+      for (let minutes = 3; minutes <= MAX_WINDOW_MINUTES; minutes += 1) {
+        const windowStart = effectiveTimestamp - minutes * 60;
+        let total = 0;
+        for (const event of events) {
+          if (event.timestamp > windowStart) {
+            total += Number(event.increment || 0);
+          }
+        }
+        const rate = total / minutes;
+        const isOver = rate >= overThreshold;
+        if (isOver && minutes > bestOverMinutes) {
+          bestOverMinutes = minutes;
+          bestOverTotal = total;
+        }
+      }
+
+      if (bestOverMinutes && bestOverTotal >= 3) {
+        if (statKey === "points") {
+          playerMessages.push({
+            text: `${playerLabel} has scored ${bestOverTotal} points in the last ${bestOverMinutes} minutes.`,
+            tone: "good",
+          });
+        } else {
+          playerMessages.push({
+            text: `${playerLabel} has ${bestOverTotal} ${trendsStatLabel(statKey)} in the last ${bestOverMinutes} minutes.`,
+            tone: "good",
+          });
+        }
+      }
+    }
+  }
+
+  return { messages, playerMessages };
+}
+
+function buildPlayerNameMapFromLiveStats(payload) {
+  const map = {};
+  const datasets = [
+    payload?.ucsb_players?.rows || [],
+    payload?.opponent_players?.rows || [],
+  ];
+  for (const rows of datasets) {
+    for (const row of rows) {
+      const rowKey = String(row?.row_key || "");
+      const playerName = String(row?.Player || "").trim();
+      const match = rowKey.match(/_player_([A-Za-z0-9_-]+)$/);
+      if (!match || !playerName) continue;
+      const athleteId = match[1];
+      map[athleteId] = playerName;
+    }
+  }
+  return map;
+}
+
+function getPerformanceColor(liveStats, seasonStatsPer, threshold) {
+  const stat = parseFloat(liveStats);
+  const per_game = parseFloat(seasonStatsPer);
+
+  if (isNaN(stat) || isNaN(per_game) || per_game === 0) {
+    return undefined;
+  }
+
+  const diff = (stat - per_game) / per_game;
+
+  if (diff >= threshold) {
+    return "rgba(0, 255, 0, 0.2)";
+  } else if (diff <= -threshold) {
+    return "rgba(255, 0, 0, 0.2)";
+  }
+
+  return undefined;
+}
+
+function DataTable({ columns, rows, state, onChange, extraControls = null, getRowStyle, onRowClick }) {
+  const rowRefs = useRef({});
+
+  const sortedRows = useMemo(() => {
+    const filter = state.filter.toLowerCase();
+    const filtered = rows.filter((row) => {
+      if (row.row_key === state.forcedRowKey) {
+        return true;
+      }
+      if (!filter) {
+        return true;
+      }
+      return columns.some((column) =>
+        String(row[column] ?? "")
+          .toLowerCase()
+          .includes(filter),
+      );
+    });
+
+    if (!state.sortColumn) {
+      return filtered;
+    }
+
+    const sorted = [...filtered].sort((left, right) => {
+      const a = comparableValue(left[state.sortColumn]);
+      const b = comparableValue(right[state.sortColumn]);
+      if (a.type === "number" && b.type === "number") {
+        return a.value - b.value;
+      }
+      return String(a.value).localeCompare(String(b.value));
+    });
+
+    if (state.sortDirection === "desc") {
+      sorted.reverse();
+    }
+    return sorted;
+  }, [rows, columns, state]);
+
+  useEffect(() => {
+    if (!state.highlightRowKey) {
+      return;
+    }
+    const target = rowRefs.current[state.highlightRowKey];
+    if (target) {
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [state.highlightRowKey]);
+
+  if (!columns.length) {
+    return <div className="table-empty">No columns available.</div>;
+  }
+
+  return (
+    <div className="table-shell">
+      <div className="table-controls">
+        <input
+          type="text"
+          value={state.filter}
+          placeholder="Filter rows"
+          onChange={(event) => onChange({ filter: event.target.value })}
+        />
+        <select
+          value={state.sortColumn}
+          onChange={(event) => onChange({ sortColumn: event.target.value })}
+        >
+          <option value="">Sort by</option>
+          {columns.map((column) => (
+            <option value={column} key={column}>
+              {column}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          onClick={() =>
+            onChange({
+              sortDirection: state.sortDirection === "asc" ? "desc" : "asc",
+            })
+          }
+          disabled={!state.sortColumn}
+        >
+          {state.sortDirection === "asc" ? "Asc" : "Desc"}
+        </button>
+        {state.forcedRowKey ? (
+          <button
+            type="button"
+            className="neutral"
+            onClick={() => onChange({ forcedRowKey: "", highlightRowKey: "" })}
+          >
+            Clear evidence focus
+          </button>
+        ) : null}
+        {extraControls}
+      </div>
+
+      <div className="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              {columns.map((column) => (
+                <th key={column}>{column}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {sortedRows.map((row, index) => {
+              const rowKeyValue =
+                row.row_key || `${index}_${columns[0] || "row"}`;
+              const isSelected =
+                row.row_key && row.row_key === state.selectedRowKey;
+              const isHighlighted =
+                row.row_key && row.row_key === state.highlightRowKey;
+              const rowStyle = getRowStyle ? getRowStyle(row) : {};
+
+              return (
+                <tr
+                  key={rowKeyValue}
+                  ref={(node) => {
+                    if (row.row_key && node) {
+                      rowRefs.current[row.row_key] = node;
+                    }
+                  }}
+                  className={`${isSelected ? "selected" : ""} ${isHighlighted ? "highlighted" : ""}`.trim()}
+                  style={{ ...rowStyle, cursor: onRowClick ? 'pointer' : 'default' }}
+                  onClick={() => {
+                    onChange({
+                      selectedRowKey: row.row_key || "",
+                      highlightRowKey: row.row_key || state.highlightRowKey,
+                    });
+                    if (onRowClick) onRowClick(row);
+                  }}
+                >
+                  {columns.map((column) => (
+                    <td key={`${rowKeyValue}_${column}`}>{row[column]}</td>
+                  ))}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function InsightBubble({
+  insight,
+  onSave,
+  onEvidenceClick,
+  saveText,
+  resolveTeamName,
+}) {
+  return (
+    <article className="bubble">
+      <header>
+        <h4>Insight</h4>
+        <button type="button" onClick={onSave}>
+          {saveText}
+        </button>
+      </header>
+      <p>{insight.insight}</p>
+      <div className="evidence-list">
+        {(insight.evidence || []).map((ref, index) => (
+          <button
+            key={`${ref.row_key}_${index}`}
+            type="button"
+            className="evidence-chip"
+            onClick={() => onEvidenceClick(ref)}
+          >
+            {evidenceLabel(ref, resolveTeamName)}
+          </button>
+        ))}
+      </div>
+    </article>
+  );
+}
+
+
+function buildScoringEventKey(row, derivedPoints) {
+  const actorId = String(row.athlete_id || "").trim();
+  const period = String(row.period || "").trim();
+  const clock = String(row.clock || "").trim();
+  const playType = String(row.type || "").toLowerCase();
+  const text = String(row.text || "").toLowerCase().trim();
+
+  if (playType === "madefreethrow") {
+    return `${actorId}|${period}|${clock}|ft|${text}`;
+  }
+
+  return `${actorId}|${period}|${clock}|${derivedPoints}`;
+}
+
+function collectPlayerPbpIncrements(row, seenScoringEvents) {
+  const incrementsByPlayer = {};
+  const playType = String(row.type || "");
+  const text = String(row.text || "").toLowerCase();
+  const derivedPoints = getPointsFromPbp(row);
+  const shootingPlay = Boolean(row.shooting_play);
+  const pointsAttempted = Number(row.points_attempted || 0);
+  const actorId = String(row.athlete_id || "").trim();
+  const assistId = String(row.assist_athlete_id || "").trim();
+
+  const isNewScoringEvent =
+    derivedPoints > 0 &&
+    (() => {
+      const eventKey = buildScoringEventKey(row, derivedPoints);
+      if (seenScoringEvents.has(eventKey)) return false;
+      seenScoringEvents.add(eventKey);
+      return true;
+    })();
+
+  if (actorId) {
+    incrementsByPlayer[actorId] = {};
+
+    if (isNewScoringEvent) {
+      incrementsByPlayer[actorId].points = derivedPoints;
+    }
+
+    if (shootingPlay && (pointsAttempted === 2 || pointsAttempted === 3)) {
+      incrementsByPlayer[actorId].field_goals_attempted = 1;
+      if (pointsAttempted === 3) {
+        incrementsByPlayer[actorId].three_pointers_attempted = 1;
+      }
+    }
+
+    if (isNewScoringEvent && (derivedPoints === 2 || derivedPoints === 3)) {
+      incrementsByPlayer[actorId].field_goals_made = 1;
+      if (derivedPoints === 3) {
+        incrementsByPlayer[actorId].three_pointers_made = 1;
+      }
+    }
+
+    if (text.includes("free throw")) {
+      incrementsByPlayer[actorId].free_throws_attempted = 1;
+      if (isNewScoringEvent && derivedPoints === 1) {
+        incrementsByPlayer[actorId].free_throws_made = 1;
+      }
+    }
+
+    if (playType === "Offensive Rebound") {
+      incrementsByPlayer[actorId].offensive_rebounds = 1;
+      incrementsByPlayer[actorId].rebounds = 1;
+    } else if (playType === "Defensive Rebound") {
+      incrementsByPlayer[actorId].defensive_rebounds = 1;
+      incrementsByPlayer[actorId].rebounds = 1;
+    }
+
+    if (playType === "Steal") incrementsByPlayer[actorId].steals = 1;
+    if (playType === "Block Shot") incrementsByPlayer[actorId].blocks = 1;
+    if (playType.toLowerCase().includes("turnover")) incrementsByPlayer[actorId].turnovers = 1;
+    if (playType.toLowerCase().includes("foul")) incrementsByPlayer[actorId].fouls = 1;
+  }
+
+  if (assistId && isNewScoringEvent) {
+    if (!incrementsByPlayer[assistId]) incrementsByPlayer[assistId] = {};
+    incrementsByPlayer[assistId].assists =
+      Number(incrementsByPlayer[assistId].assists || 0) + 1;
+  }
+
+  return incrementsByPlayer;
+}
+
+function parseClock(clockValue) {
+  const clock = String(clockValue || "").trim();
+  const match = clock.match(/^(\d+):(\d{2})$/);
+  if (!match) return 0;
+  const minutes = Number(match[1]);
+  const seconds = Number(match[2]);
+  return minutes * 60 + seconds;
+}
+
+function parsePeriod(periodValue) {
+  const raw = String(periodValue || "").toLowerCase().trim();
+  if (!raw) return 1;
+  if (raw.includes("1")) return 1;
+  if (raw.includes("2")) return 2;
+  if (raw.includes("3")) return 3;
+  if (raw.includes("4")) return 4;
+  const numeric = Number(raw);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : 1;
+}
+
+function getElapsedGameMinute(row) {
+  const period = parsePeriod(row.period || 1);
+  const clockSeconds = parseClock(row.clock);
+  const Regulation_Period_Seconds = 20 * 60
+  const Overtime_Seconds = 5 * 60
+  let elapsedSeconds = 0;
+  if (period <= 2) {
+    elapsedSeconds = (period - 1) * Regulation_Period_Seconds + (Regulation_Period_Seconds - clockSeconds);
+  } else {
+    elapsedSeconds = 2 * Regulation_Period_Seconds + (period - 3) * Overtime_Seconds + (Overtime_Seconds - clockSeconds);
+  }
+  return Math.floor(elapsedSeconds / 60)
+}
+
+export default function App() {
+  const [activeView, setActiveView] = useState("advanced");
+  const isAdvancedView = activeView === "advanced";
+  const isBasicView = activeView === "basic";
+  const isDataVizView = activeView === "dataViz";
+  const [advancedTabsOpen, setAdvancedTabsOpen] = useState(false);
+  const [topBarAutoRefreshOpen, setTopBarAutoRefreshOpen] = useState(false);
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
+  const [profileUser, setProfileUser] = useState(() => getStoredProfile());
+  const [googleAuthReady, setGoogleAuthReady] = useState(false);
+  const [googleAuthError, setGoogleAuthError] = useState("");
+  const [advancedTabs, setAdvancedTabs] = useState({
+    seasonData: true,
+    gameData: true,
+    trends: true,
+    sharedNotes: true,
+    playerPerformance: true,
+  });
+  const [activeSeasonSide, setActiveSeasonSide] = useState("ucsb");
+  const [seasonDataCollapsed, setSeasonDataCollapsed] = useState(false);
+  const [gameDataCollapsed, setGameDataCollapsed] = useState(false);
+  const [trendsCollapsed, setTrendsCollapsed] = useState(false);
+  const [promptCollapsed, setPromptCollapsed] = useState(false);
+  const [selectedStoryPlayerOneId, setSelectedStoryPlayerOneId] = useState("");
+  const [selectedStoryPlayerTwoId, setSelectedStoryPlayerTwoId] = useState("");
+  const [insightsView, setInsightsView] = useState("timeline");
+  const [savedCollapsed, setSavedCollapsed] = useState(false);
+  const [insightsColumnCollapsed, setInsightsColumnCollapsed] = useState(false);
+  const [performanceMetric, setPerformanceMetric] = useState("PTS");
+
+  const advancedTabsButtonRef = useRef(null);
+  const advancedTabsMenuRef = useRef(null);
+  const topBarAutoRefreshButtonRef = useRef(null);
+  const topBarAutoRefreshMenuRef = useRef(null);
+  const profileMenuButtonRef = useRef(null);
+  const profileMenuRef = useRef(null);
+  const googleSignInButtonRef = useRef(null);
+  const googleAuthInitializedRef = useRef(false);
+  const sharedMessagesListRef = useRef(null);
+  const seasonDataPanelRef = useRef();
+  const gameDataPanelRef = useRef();
+  const trendsPanelRef = useRef();
+  const promptPanelRef = useRef();
+  const savedPanelRef = useRef();
+  const insightsColumnRef = useRef();
+  const trendsUpdatingRef = useRef(false);
+  const pbpUpdatingRef = useRef(false);
+
+  const [opponentTeamId, setOpponentTeamId] = useState("ucr");
+  const [espnTeams, setEspnTeams] = useState([]);
+  const [teamsLoading, setTeamsLoading] = useState(false);
+  const [teamsError, setTeamsError] = useState("");
+  const [seasonPlayers, setSeasonPlayers] = useState({
+    ucsb: { columns: [], rows: [] },
+    opponent: { columns: [], rows: [] },
+  });
+  const [seasonPlayersLoading, setSeasonPlayersLoading] = useState({
+    ucsb: false,
+    opponent: false,
+  });
+  const [seasonPlayersError, setSeasonPlayersError] = useState({
+    ucsb: "",
+    opponent: "",
+  });
+  const [seasonPlayersTableState, setSeasonPlayersTableState] = useState({
+    ucsb: { ...DEFAULT_TABLE_STATE },
+    opponent: { ...DEFAULT_TABLE_STATE },
+  });
+
+  const [pbpData, setPbpData] = useState({
+    columns: [],
+    rows: [],
+    team_id: PBP_TEAM_ID,
+    updated_at: "",
+    source_url: "",
+  });
+  const [pbpGameId, setPbpGameId] = useState("401928351");
+  const [scoreDiffGameId, setScoreDiffGameId] = useState("401928351");
+  const [scoreDiffRows, setScoreDiffRows] = useState(null);
+  const [pbpGameOptions, setPbpGameOptions] = useState([]);
+  const [pbpAutoRefreshEnabled, setPbpAutoRefreshEnabled] = useState(false);
+  const [pbpAutoRefreshSeconds, setPbpAutoRefreshSeconds] = useState(15);
+  const [pbpTableState, setPbpTableState] = useState({
+    ...DEFAULT_TABLE_STATE,
+  });
+  const [pbpAdvancedFiltersDraft, setPbpAdvancedFiltersDraft] = useState({
+    ...DEFAULT_PBP_ADVANCED_FILTERS,
+  });
+  const [pbpAppliedFilters, setPbpAppliedFilters] = useState({
+    ...DEFAULT_PBP_ADVANCED_FILTERS,
+  });
+  const [pbpAdvancedOpen, setPbpAdvancedOpen] = useState(false);
+  const [pbpLoading, setPbpLoading] = useState(false);
+  const [pbpUpdating, setPbpUpdating] = useState(false);
+  const [pbpError, setPbpError] = useState("");
+
+  const [gameDataSubtab, setGameDataSubtab] = useState("live-stats");
+  const [liveStats, setLiveStats] = useState(() => ({
+    ucsb_team: { columns: [], rows: [] },
+    ucsb_players: { columns: [], rows: [] },
+    opponent_team: { columns: [], rows: [] },
+    opponent_players: { columns: [], rows: [] },
+  }));
+  const [activeLiveSide, setActiveLiveSide] = useState("ucsb");
+  const [liveStatsLoading, setLiveStatsLoading] = useState(false);
+  const [liveStatsError, setLiveStatsError] = useState("");
+  const [livePlayersTableState, setLivePlayersTableState] = useState({
+    ucsb: { ...DEFAULT_TABLE_STATE },
+    opponent: { ...DEFAULT_TABLE_STATE },
+  });
+  const [trendsUpdating, setTrendsUpdating] = useState(false);
+  const [trendsError, setTrendsError] = useState("");
+  const [trendsUpdatedAt, setTrendsUpdatedAt] = useState("");
+  const [trendsTimelines, setTrendsTimelines] = useState({});
+  const [trendsPlayerTimelines, setTrendsPlayerTimelines] = useState({});
+  const [trendsMessages, setTrendsMessages] = useState([]);
+  const [trendsPlayerMessages, setTrendsPlayerMessages] = useState([]);
+  const [trendsOverMultiplier, setTrendsOverMultiplier] = useState(1);
+  const [trendsUnderMultiplier, setTrendsUnderMultiplier] = useState(1);
+  const [trendsCurrentHalf, setTrendsCurrentHalf] = useState("1");
+  const [trendsCurrentTimestamp, setTrendsCurrentTimestamp] = useState(10 * 60);
+  const [trendsCheckpointLabel, setTrendsCheckpointLabel] =
+    useState("1st Half 10:00");
+  const [basicTrendsAutoUpdate, setBasicTrendsAutoUpdate] = useState(false);
+  const [basicTrendsAutoSeconds, setBasicTrendsAutoSeconds] = useState(10);
+  const [sharedMessages, setSharedMessages] = useState([]);
+  const [sharedMessageDraft, setSharedMessageDraft] = useState("");
+  const [sharedMessageShowName, setSharedMessageShowName] = useState(true);
+  const [sharedNoteUpdatedAt, setSharedNoteUpdatedAt] = useState("");
+  const [sharedNoteLoading, setSharedNoteLoading] = useState(true);
+  const [sharedNoteSaving, setSharedNoteSaving] = useState(false);
+  const [sharedNoteError, setSharedNoteError] = useState("");
+
+  const [pbpComparePlayer1, setPbpComparePlayer1] = useState("");
+  const [pbpComparePlayer2, setPbpComparePlayer2] = useState("");
+  const [pbpCompareMetric, setPbpCompareMetric] = useState("points");
+
+  const [prompt, setPrompt] = useState("");
+  const [contextEnabled, setContextEnabled] = useState({
+    ucsbTeam: true,
+    ucsbPlayers: true,
+    opponentTeam: true,
+    opponentPlayers: true,
+  });
+  const [insights, setInsights] = useState([]);
+  const [savedInsights, setSavedInsights] = useState([]);
+  const [insightLoading, setInsightLoading] = useState(false);
+  const [insightError, setInsightError] = useState("");
+
+  // --- NEW: Player Modal State ---
+  const [selectedModalPlayer, setSelectedModalPlayer] = useState(null);
+  const [recentGames, setRecentGames] = useState([]);
+  const [isModalLoading, setIsModalLoading] = useState(false);
+
+
+  const handleGoogleCredential = useCallback((response) => {
+    try {
+      const payload = decodeJwtPayload(response.credential);
+      const nextProfile = {
+        name: payload.name || payload.email || "Google user",
+        email: payload.email || "",
+        picture: payload.picture || "",
+      };
+      setProfileUser(nextProfile);
+      setStoredProfile(nextProfile);
+      setGoogleAuthError("");
+      setProfileMenuOpen(false);
+    } catch {
+      setGoogleAuthError("Google sign-in succeeded, but the profile could not be read.");
+    }
+  }, []);
+
+  const handleProfileLogout = useCallback(() => {
+    setProfileUser(null);
+    setStoredProfile(null);
+    window.google?.accounts?.id?.disableAutoSelect();
+    setProfileMenuOpen(false);
+  }, []);
+
+  const handlePlayerRowClick = async (row) => {
+    // Only open the modal if we click a row that has a player ID in the key
+    if (!row.row_key || !row.row_key.includes("_player_")) return;
+
+    const athleteId = row.row_key.split('_').pop();
+    if (!athleteId || athleteId === "undefined") return;
+
+    setSelectedModalPlayer(row.Player || "Player");
+    setIsModalLoading(true);
+    setRecentGames([]);
+
+    try {
+      const res = await fetch(`${API_BASE}/api/players/${athleteId}/recent-games`);
+      if (!res.ok) throw new Error("Failed to fetch");
+      const data = await res.json();
+      setRecentGames(data.games || []);
+    } catch (err) {
+      console.error("Failed to fetch recent games:", err);
+    } finally {
+      setIsModalLoading(false);
+    }
+  };
+
+  const closePlayerModal = () => {
+    setSelectedModalPlayer(null);
+    setRecentGames([]);
+  };
+  // -------------------------------
+
+  const normalizedOpponentTeamId = useMemo(() => normalizeTeamIdInput(opponentTeamId), [opponentTeamId]);
+  const sortedPlayers = useMemo(() => {
+    return Object.entries(trendsPlayerTimelines).sort(([, a], [, b]) => {
+      const aIsUcsb = a.team_id === UCSB_TEAM_ID;
+      const bIsUcsb = b.team_id === UCSB_TEAM_ID;
+
+      if (aIsUcsb && !bIsUcsb) return -1;
+      if (!aIsUcsb && bIsUcsb) return 1;
+
+      return (a.player_name || "").localeCompare(b.player_name || "");
+    });
+  }, [trendsPlayerTimelines]);
+
+  const teamNameById = useMemo(() => {
+    const map = {};
+    for (const team of espnTeams) {
+      const id = normalizeTeamIdInput(team.team_id);
+      if (!id) {
+        continue;
+      }
+      map[id] = team.school_name || team.abbreviation || id;
+    }
+    map[UCSB_TEAM_ID] = map[UCSB_TEAM_ID] || "UC Santa Barbara";
+    return map;
+  }, [espnTeams]);
+
+  const pbpPlayerNameById = useMemo(() => {
+    const map = {};
+    const datasets = [
+      liveStats.ucsb_players?.rows || [],
+      liveStats.opponent_players?.rows || [],
+    ];
+    for (const rows of datasets) {
+      for (const row of rows) {
+        const rowKey = String(row?.row_key || "");
+        const playerName = String(row?.Player || "").trim();
+        const match = rowKey.match(/_player_([A-Za-z0-9_-]+)$/);
+        if (!match || !playerName) continue;
+        map[match[1]] = playerName;
+      }
+    }
+    return map;
+  }, [liveStats]);
+
+  const activeGameOption = useMemo(
+    () => pbpGameOptions.find((option) => option.value === pbpGameId) || null,
+    [pbpGameOptions, pbpGameId],
+  );
+
+  const ucsbPbpRows = useMemo(() => {
+    return (pbpData.rows || []).filter((row) => {
+      const normalized = normalizeTeamIdInput(String(row.team_id || "").trim());
+      return normalized === normalizeTeamIdInput(UCSB_TEAM_ID) || normalized === "ucsb";
+    });
+  }, [pbpData.rows]);
+
+  const oppPbpRows = useMemo(() => {
+    const ucsbNorm = normalizeTeamIdInput(UCSB_TEAM_ID);
+    return (pbpData.rows || []).filter((row) => {
+      const normalized = normalizeTeamIdInput(String(row.team_id || "").trim());
+      return Boolean(normalized) && normalized !== ucsbNorm && normalized !== "ucsb";
+    });
+  }, [pbpData.rows]);
+
+  const activeGameOpponentId = useMemo(() => {
+    if (activeGameOption?.opponentTeamId) {
+      return normalizeTeamIdInput(activeGameOption.opponentTeamId);
+    }
+    const firstOppRow = oppPbpRows.find((row) => String(row.team_id || "").trim());
+    if (firstOppRow) {
+      return normalizeTeamIdInput(String(firstOppRow.team_id).trim());
+    }
+    return normalizedOpponentTeamId || "opponent";
+  }, [activeGameOption, oppPbpRows, normalizedOpponentTeamId]);
+
+  const activeGameOpponentName = useMemo(() => {
+    return (
+      activeGameOption?.opponentName ||
+      teamNameById[activeGameOpponentId] ||
+      teamNameById[normalizedOpponentTeamId] ||
+      "Opponent"
+    );
+  }, [activeGameOption, teamNameById, activeGameOpponentId, normalizedOpponentTeamId]);
+
+  const ucsbAvailablePlayers = useMemo(() => {
+    const ids = new Set();
+    for (const row of ucsbPbpRows) {
+      const actorId = String(row.athlete_id || "").trim();
+      const assistId = String(row.assist_athlete_id || "").trim();
+      if (actorId) ids.add(actorId);
+      if (assistId) ids.add(assistId);
+    }
+    return Array.from(ids)
+      .map((id) => ({
+        id,
+        name: pbpPlayerNameById[id] || `Player ${id}`,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [ucsbPbpRows, pbpPlayerNameById]);
+
+  const oppAvailablePlayers = useMemo(() => {
+    const ids = new Set();
+    for (const row of oppPbpRows) {
+      const actorId = String(row.athlete_id || "").trim();
+      const assistId = String(row.assist_athlete_id || "").trim();
+      if (actorId) ids.add(actorId);
+      if (assistId) ids.add(assistId);
+    }
+    return Array.from(ids)
+      .map((id) => ({
+        id,
+        name: pbpPlayerNameById[id] || `Player ${id}`,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [oppPbpRows, pbpPlayerNameById]);
+
+  const allPlayersList = useMemo(() => {
+    return [
+      ...ucsbAvailablePlayers.map((player) => ({
+        ...player,
+        team_id: UCSB_TEAM_ID,
+      })),
+      ...oppAvailablePlayers.map((player) => ({
+        ...player,
+        team_id: activeGameOpponentId || "opponent",
+      })),
+    ];
+  }, [ucsbAvailablePlayers, oppAvailablePlayers, activeGameOpponentId]);
+
+  useEffect(() => {
+    setSelectedStoryPlayerOneId("");
+    setSelectedStoryPlayerTwoId("");
+  }, [pbpGameId]);
+
+  const pbpComparisonChartData = useMemo(() => {
+    if (!pbpComparePlayer1 || !pbpComparePlayer2) return [];
+    const player1Name = pbpPlayerNameById[pbpComparePlayer1] || "Player 1";
+    const player2Name = pbpPlayerNameById[pbpComparePlayer2] || "Player 2";
+
+    let total1 = 0;
+    let total2 = 0;
+
+    const minuteMap = new Map();
+    const seenScoringEvents = new Set();
+    for (const row of pbpData.rows || []) {
+      const incrementsByPlayer = collectPlayerPbpIncrements(row, seenScoringEvents);
+
+      total1 += Number(incrementsByPlayer[pbpComparePlayer1]?.[pbpCompareMetric] || 0);
+      total2 += Number(incrementsByPlayer[pbpComparePlayer2]?.[pbpCompareMetric] || 0);
+      const minute = getElapsedGameMinute(row);
+
+      if (!Number.isFinite(minute)) continue;
+
+      minuteMap.set(minute, {
+        minute,
+        [player1Name]: total1,
+        [player2Name]: total2,
+      });
+    }
+    if (minuteMap.size === 0) return [];
+    const maxMinute = Math.max(...minuteMap.keys());
+    if (!Number.isFinite(maxMinute)) return [];
+    const output = [];
+    let last1 = 0;
+    let last2 = 0;
+
+    for (let minute = 0; minute <= maxMinute; minute += 1) {
+      const row = minuteMap.get(minute);
+      if (row) {
+        last1 = row[player1Name];
+        last2 = row[player2Name];
+      }
+      output.push({
+        minute,
+        minuteLabel: `${minute}`,
+        [player1Name]: last1,
+        [player2Name]: last2,
+      });
+    }
+    return output;
+  }, [
+    pbpData.rows,
+    pbpComparePlayer1,
+    pbpComparePlayer2,
+    pbpCompareMetric,
+    pbpPlayerNameById,
+  ]);
+
+  useEffect(() => {
+    if (!advancedTabsOpen) {
+      return;
+    }
+    const handleMouseDown = (event) => {
+      if (
+        advancedTabsMenuRef.current?.contains(event.target) ||
+        advancedTabsButtonRef.current?.contains(event.target)
+      ) {
+        return;
+      }
+      setAdvancedTabsOpen(false);
+    };
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setAdvancedTabsOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleMouseDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handleMouseDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [advancedTabsOpen]);
+
+
+  useEffect(() => {
+    if (!topBarAutoRefreshOpen) {
+      return;
+    }
+    const handleMouseDown = (event) => {
+      if (
+        topBarAutoRefreshMenuRef.current?.contains(event.target) ||
+        topBarAutoRefreshButtonRef.current?.contains(event.target)
+      ) {
+        return;
+      }
+      setTopBarAutoRefreshOpen(false);
+    };
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setTopBarAutoRefreshOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleMouseDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handleMouseDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [topBarAutoRefreshOpen]);
+
+  useEffect(() => {
+    if (!GOOGLE_CLIENT_ID) {
+      return;
+    }
+    if (window.google?.accounts?.id) {
+      setGoogleAuthReady(true);
+      return;
+    }
+
+    let attempts = 0;
+    const scriptCheckInterval = window.setInterval(() => {
+      attempts += 1;
+      if (window.google?.accounts?.id) {
+        window.clearInterval(scriptCheckInterval);
+        setGoogleAuthReady(true);
+      } else if (attempts >= 50) {
+        window.clearInterval(scriptCheckInterval);
+        setGoogleAuthError("Google sign-in could not load.");
+      }
+    }, 100);
+
+    return () => window.clearInterval(scriptCheckInterval);
+  }, []);
+
+  useEffect(() => {
+    if (!GOOGLE_CLIENT_ID || !googleAuthReady || profileUser) {
+      return;
+    }
+    if (!googleAuthInitializedRef.current) {
+      window.google.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        callback: handleGoogleCredential,
+        auto_select: false,
+      });
+      googleAuthInitializedRef.current = true;
+    }
+    if (profileMenuOpen && googleSignInButtonRef.current) {
+      googleSignInButtonRef.current.innerHTML = "";
+      window.google.accounts.id.renderButton(googleSignInButtonRef.current, {
+        theme: "outline",
+        size: "medium",
+        type: "standard",
+        text: "signin_with",
+        shape: "rectangular",
+      });
+    }
+  }, [googleAuthReady, handleGoogleCredential, profileMenuOpen, profileUser]);
+
+  useEffect(() => {
+    if (!profileMenuOpen) {
+      return;
+    }
+    const handleMouseDown = (event) => {
+      if (
+        profileMenuRef.current?.contains(event.target) ||
+        profileMenuButtonRef.current?.contains(event.target)
+      ) {
+        return;
+      }
+      setProfileMenuOpen(false);
+    };
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setProfileMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleMouseDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handleMouseDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [profileMenuOpen]);
+
+  useEffect(() => {
+    if (!isAdvancedView) {
+      setAdvancedTabsOpen(false);
+      setTopBarAutoRefreshOpen(false);
+    }
+  }, [isAdvancedView]);
+
+  const loadEspnTeams = useCallback(async () => {
+    setTeamsLoading(true);
+    setTeamsError("");
+    try {
+      const payload = await fetchJson(`${API_BASE}/api/espn/teams`, {}, 1);
+      const teams = Array.isArray(payload.teams) ? payload.teams : [];
+      setEspnTeams(teams);
+    } catch (error) {
+      setTeamsError(error.message);
+    } finally {
+      setTeamsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadEspnTeams();
+  }, [loadEspnTeams]);
+
+
+
+  useEffect(() => {
+    trendsUpdatingRef.current = trendsUpdating;
+  }, [trendsUpdating]);
+
+  useEffect(() => {
+    pbpUpdatingRef.current = pbpUpdating;
+  }, [pbpUpdating]);
+
+  const hasAutoSelectedGameRef = useRef(false);
+
+  const loadPbpIds = useCallback(async () => {
+    try {
+      const payload = await fetchJson(`${API_BASE}/api/gameids?limit=10`, {}, 1);
+      const options = (payload.games || []).map((g) => ({
+        value: g.id,
+        label: g.label,
+        opponentTeamId: g.opponent_team_id || "",
+        opponentName: g.opponent_name || "",
+      }));
+      setPbpGameOptions(options);
+      if (options.length > 0) {
+        if (!hasAutoSelectedGameRef.current) {
+          hasAutoSelectedGameRef.current = true;
+          setPbpGameId(options[0].value);
+          setScoreDiffGameId(options[0].value);
+        } else {
+          setPbpGameId((prev) => (options.some((o) => o.value === prev) ? prev : options[0].value));
+          setScoreDiffGameId((prev) => (options.some((o) => o.value === prev) ? prev : options[0].value));
+        }
+      }
+    } catch (error) {
+      console.error("Error fetching PBP IDs:", error);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadPbpIds();
+  }, [loadPbpIds]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadScoreDiffRows() {
+      try {
+        const payload = await fetchJson(
+          `${API_BASE}/api/pbp?game_id=${encodeURIComponent(scoreDiffGameId)}`,
+          {},
+          1,
+        );
+        if (!cancelled) setScoreDiffRows(payload.rows || []);
+      } catch {
+        if (!cancelled) setScoreDiffRows([]);
+      }
+    }
+    loadScoreDiffRows();
+    return () => { cancelled = true; };
+  }, [scoreDiffGameId]);
+
+  const loadSharedNote = useCallback(async () => {
+    try {
+      const payload = await fetchJson(`${API_BASE}/api/shared-note`, {}, 1);
+      const nextMessages = Array.isArray(payload.messages)
+        ? payload.messages.map((message) => ({
+            id: String(message.id || ""),
+            text: String(message.text || ""),
+            authorName:
+              String(message.author_name || "") === "Anonymous"
+                ? ""
+                : String(message.author_name || ""),
+            authorEmail: String(message.author_email || ""),
+            createdAt: String(message.created_at || ""),
+          }))
+        : [];
+      const nextUpdatedAt = String(payload.updated_at || "");
+      setSharedNoteError("");
+      setSharedNoteUpdatedAt(nextUpdatedAt);
+      setSharedNoteLoading(false);
+      setSharedMessages(nextMessages);
+    } catch (error) {
+      setSharedNoteLoading(false);
+      setSharedNoteError(error.message);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadSharedNote();
+    const intervalId = window.setInterval(() => {
+      loadSharedNote();
+    }, 2000);
+    return () => window.clearInterval(intervalId);
+  }, [loadSharedNote]);
+
+  useEffect(() => {
+    const messagesList = sharedMessagesListRef.current;
+    if (!messagesList) {
+      return;
+    }
+    messagesList.scrollTop = messagesList.scrollHeight;
+  }, [sharedMessages]);
+
+  const loadSeasonPlayers = useCallback(async (side, teamId) => {
+    const normalizedTeamId = normalizeTeamIdInput(teamId);
+    if (!normalizedTeamId) {
+      return;
+    }
+    setSeasonPlayersLoading((prev) => ({ ...prev, [side]: true }));
+    setSeasonPlayersError((prev) => ({ ...prev, [side]: "" }));
+    try {
+      const payload = await fetchJson(
+        `${API_BASE}/api/espn/season/${normalizedTeamId}/player`,
+        {},
+        1,
+      );
+      const safeColumns = (payload.columns || []).filter(
+        (column) => !HIDDEN_COLUMNS.has(column),
+      );
+      setSeasonPlayers((prev) => ({
+        ...prev,
+        [side]: { columns: safeColumns, rows: payload.rows || [] },
+      }));
+    } catch (error) {
+      setSeasonPlayersError((prev) => ({ ...prev, [side]: error.message }));
+      setSeasonPlayers((prev) => ({
+        ...prev,
+        [side]: { columns: [], rows: [] },
+      }));
+    } finally {
+      setSeasonPlayersLoading((prev) => ({ ...prev, [side]: false }));
+    }
+  }, []);
+
+  useEffect(() => {
+    loadSeasonPlayers("ucsb", UCSB_TEAM_ID);
+  }, [loadSeasonPlayers]);
+
+  useEffect(() => {
+    if (!normalizedOpponentTeamId) {
+      setSeasonPlayers((prev) => ({
+        ...prev,
+        opponent: { columns: [], rows: [] },
+      }));
+      setSeasonPlayersError((prev) => ({ ...prev, opponent: "" }));
+      return;
+    }
+    loadSeasonPlayers("opponent", normalizedOpponentTeamId);
+  }, [loadSeasonPlayers, normalizedOpponentTeamId]);
+
+  const loadPbp = useCallback(
+    async (gameId) => {
+      const gid = gameId ?? pbpGameId;
+      const clientValidationError =
+        validatePbpAdvancedFilters(pbpAppliedFilters);
+      if (clientValidationError) {
+        return;
+      }
+      const filterQuery = buildPbpFilterQuery(pbpAppliedFilters);
+      const url = `${API_BASE}/api/pbp?game_id=${encodeURIComponent(gid)}${filterQuery ? `&${filterQuery}` : ""}`;
+      setPbpLoading(true);
+      setPbpError("");
+      try {
+        const payload = await fetchJson(url, {}, 1);
+        const safeColumns = (payload.columns || []).filter(
+          (column) => !HIDDEN_COLUMNS.has(column),
+        );
+        setPbpData({
+          columns: safeColumns,
+          rows: payload.rows || [],
+          team_id: payload.team_id || PBP_TEAM_ID,
+          updated_at: payload.updated_at || "",
+          source_url: payload.source_url || "",
+        });
+      } catch (error) {
+        setPbpError(error.message);
+        setPbpData((prev) => ({ ...prev, columns: [], rows: [] }));
+      } finally {
+        setPbpLoading(false);
+      }
+    },
+    [pbpAppliedFilters, pbpGameId],
+  );
+
+  useEffect(() => {
+    loadPbp();
+  }, [loadPbp]);
+
+  const loadLiveStats = useCallback(async () => {
+    setLiveStatsLoading(true);
+    setLiveStatsError("");
+    const ucsb = encodeURIComponent(UCSB_TEAM_ID);
+    const opponent = normalizedOpponentTeamId
+      ? encodeURIComponent(normalizedOpponentTeamId)
+      : "";
+    const gameId = encodeURIComponent(pbpGameId);
+    const url = `${API_BASE}/api/pbp/live-stats?ucsb=${ucsb}${opponent ? `&opponent=${opponent}` : ""}&game_id=${gameId}`;
+    try {
+      const payload = await fetchJson(url, {}, 1);
+      setLiveStats({
+        ucsb_team: {
+          columns: payload.ucsb_team?.columns || [],
+          rows: payload.ucsb_team?.rows || [],
+        },
+        ucsb_players: {
+          columns: payload.ucsb_players?.columns || [],
+          rows: payload.ucsb_players?.rows || [],
+        },
+        opponent_team: {
+          columns: payload.opponent_team?.columns || [],
+          rows: payload.opponent_team?.rows || [],
+        },
+        opponent_players: {
+          columns: payload.opponent_players?.columns || [],
+          rows: payload.opponent_players?.rows || [],
+        },
+      });
+    } catch (error) {
+      setLiveStatsError(error.message);
+      setLiveStats({
+        ucsb_team: { columns: [], rows: [] },
+        ucsb_players: { columns: [], rows: [] },
+        opponent_team: { columns: [], rows: [] },
+        opponent_players: { columns: [], rows: [] },
+      });
+    } finally {
+      setLiveStatsLoading(false);
+    }
+  }, [normalizedOpponentTeamId, pbpGameId]);
+
+  useEffect(() => {
+    if (!pbpLoading && !pbpError) {
+      loadLiveStats();
+    }
+  }, [pbpLoading, pbpError, loadLiveStats]);
+
+  const updatePbp = useCallback(async () => {
+    setPbpUpdating(true);
+    setPbpError("");
+    setInsightError("");
+    try {
+      await fetchJson(
+        `${API_BASE}/api/pbp/update`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ force: true, game_id: pbpGameId }),
+        },
+        1,
+      );
+      await loadPbp();
+    } catch (error) {
+      setPbpError(error.message);
+      setInsightError(error.message);
+    } finally {
+      setPbpUpdating(false);
+    }
+  }, [loadPbp, pbpGameId]);
+
+  const updateTrends = useCallback(async () => {
+    setTrendsUpdating(true);
+    setTrendsError("");
+    try {
+      await fetchJson(
+        `${API_BASE}/api/pbp/update`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ force: true, game_id: pbpGameId }),
+        },
+        1,
+      );
+      const payload = await fetchJson(
+        `${API_BASE}/api/pbp?game_id=${encodeURIComponent(pbpGameId)}`,
+        {},
+        1,
+      );
+      const opponent = normalizedOpponentTeamId
+        ? `&opponent=${encodeURIComponent(normalizedOpponentTeamId)}`
+        : "";
+      const livePayload = await fetchJson(
+        `${API_BASE}/api/pbp/live-stats?ucsb=${encodeURIComponent(UCSB_TEAM_ID)}${opponent}&game_id=${encodeURIComponent(pbpGameId)}`,
+        {},
+        1,
+      );
+      const playerNameById = buildPlayerNameMapFromLiveStats(livePayload);
+      const teamTimelines = buildTrendsAnalyticsTimelines(payload.rows || []);
+      const playerTimelines = buildTrendsPlayerAnalyticsTimelines(
+        payload.rows || [],
+        playerNameById,
+      );
+      const checkpoint = deriveTrendsCheckpoint(payload.rows || []);
+      setTrendsTimelines(teamTimelines);
+      setTrendsPlayerTimelines(playerTimelines);
+      setTrendsCurrentHalf(checkpoint.currentHalf);
+      setTrendsCurrentTimestamp(checkpoint.currentTimestamp);
+      setTrendsCheckpointLabel(checkpoint.label);
+      const { messages, playerMessages } = buildTrendsMessages({
+        teamTimelines,
+        playerTimelines,
+        teamNameById,
+        overMultiplier: trendsOverMultiplier,
+        underMultiplier: trendsUnderMultiplier,
+        currentHalf: checkpoint.currentHalf,
+        currentTimestamp: checkpoint.currentTimestamp,
+      });
+      setTrendsMessages(messages);
+      setTrendsPlayerMessages(playerMessages);
+      setTrendsUpdatedAt(payload.updated_at || new Date().toISOString());
+    } catch (error) {
+      setTrendsError(error.message);
+      setTrendsTimelines({});
+      setTrendsPlayerTimelines({});
+      setTrendsMessages([]);
+      setTrendsPlayerMessages([]);
+    } finally {
+      setTrendsUpdating(false);
+    }
+  }, [
+    pbpGameId,
+    normalizedOpponentTeamId,
+    teamNameById,
+    trendsOverMultiplier,
+    trendsUnderMultiplier,
+  ]);
+
+  useEffect(() => {
+    const { messages, playerMessages } = buildTrendsMessages({
+      teamTimelines: trendsTimelines,
+      playerTimelines: trendsPlayerTimelines,
+      teamNameById,
+      overMultiplier: trendsOverMultiplier,
+      underMultiplier: trendsUnderMultiplier,
+      currentHalf: trendsCurrentHalf,
+      currentTimestamp: trendsCurrentTimestamp,
+    });
+    setTrendsMessages(messages);
+    setTrendsPlayerMessages(playerMessages);
+  }, [
+    trendsTimelines,
+    trendsPlayerTimelines,
+    teamNameById,
+    trendsOverMultiplier,
+    trendsUnderMultiplier,
+    trendsCurrentHalf,
+    trendsCurrentTimestamp,
+  ]);
+
+  useEffect(() => {
+    if (!basicTrendsAutoUpdate || isAdvancedView) {
+      return;
+    }
+    const intervalSeconds = Number(basicTrendsAutoSeconds);
+    const safeIntervalSeconds =
+      Number.isFinite(intervalSeconds) && intervalSeconds > 0
+        ? intervalSeconds
+        : 10;
+    const tick = () => {
+      if (!trendsUpdatingRef.current) {
+        updateTrends();
+      }
+    };
+    tick();
+    const intervalId = window.setInterval(tick, safeIntervalSeconds * 1000);
+    return () => window.clearInterval(intervalId);
+  }, [
+    basicTrendsAutoUpdate,
+    basicTrendsAutoSeconds,
+    isAdvancedView,
+    updateTrends,
+  ]);
+
+  useEffect(() => {
+    if (!pbpAutoRefreshEnabled || !isAdvancedView) {
+      return;
+    }
+    const intervalSeconds = Number(pbpAutoRefreshSeconds);
+    const safeIntervalSeconds =
+      Number.isFinite(intervalSeconds) && intervalSeconds > 0
+        ? intervalSeconds
+        : 15;
+    const tick = () => {
+      if (!pbpUpdatingRef.current) {
+        updatePbp();
+      }
+    };
+    tick();
+    const intervalId = window.setInterval(tick, safeIntervalSeconds * 1000);
+    return () => window.clearInterval(intervalId);
+  }, [
+    pbpAutoRefreshEnabled,
+    pbpAutoRefreshSeconds,
+    isAdvancedView,
+    updatePbp,
+  ]);
+
+  const resolveTeamName = useCallback(
+    (teamId) => {
+      const normalized = normalizeTeamIdInput(teamId);
+      if (normalized === PBP_TEAM_ID) {
+        return "PBP";
+      }
+      if (teamNameById[normalized]) {
+        return teamNameById[normalized];
+      }
+      if (normalized === UCSB_TEAM_ID) {
+        return "UC Santa Barbara";
+      }
+      return normalized || "Team";
+    },
+    [teamNameById],
+  );
+
+  const handleEvidenceClick = useCallback(
+    (ref) => {
+      const target = resolveEvidenceTarget(
+        ref,
+        UCSB_TEAM_ID,
+        normalizedOpponentTeamId,
+      );
+      if (!target) {
+        setInsightError(
+          "Evidence target could not be resolved for the currently selected teams.",
+        );
+        return;
+      }
+
+      if (target.panel === "pbp") {
+        setPbpTableState((prev) => ({
+          ...prev,
+          selectedRowKey: target.rowKey,
+          highlightRowKey: target.rowKey,
+          forcedRowKey: target.rowKey,
+        }));
+        window.setTimeout(() => {
+          setPbpTableState((prev) => ({
+            ...prev,
+            highlightRowKey:
+              prev.highlightRowKey === target.rowKey
+                ? ""
+                : prev.highlightRowKey,
+          }));
+        }, 3500);
+        return;
+      }
+
+      setActiveSeasonSide(target.side);
+      if (target.dataset === "players") {
+        setSeasonPlayersTableState((prev) => ({
+          ...prev,
+          [target.side]: {
+            ...prev[target.side],
+            selectedRowKey: target.rowKey,
+            highlightRowKey: target.rowKey,
+            forcedRowKey: target.rowKey,
+          },
+        }));
+      }
+    },
+    [normalizedOpponentTeamId],
+  );
+
+  const ucsbDisplayName = teamNameById[UCSB_TEAM_ID] || "UC Santa Barbara";
+  const opponentDisplayName =
+    teamNameById[normalizedOpponentTeamId] ||
+    normalizedOpponentTeamId ||
+    "Opponent";
+  const activeSeasonName =
+    activeSeasonSide === "ucsb" ? ucsbDisplayName : opponentDisplayName;
+  const activeLivePrefix = activeLiveSide === "ucsb" ? "ucsb" : "opponent";
+  const activeSeasonPlayers = seasonPlayers[activeSeasonSide];
+  const activeSeasonPlayersLoading = seasonPlayersLoading[activeSeasonSide];
+  const activeSeasonPlayersError = seasonPlayersError[activeSeasonSide];
+  const activeSeasonPlayersTableState =
+    seasonPlayersTableState[activeSeasonSide];
+  const livePlayersData = liveStats[`${activeLivePrefix}_players`] || {
+    columns: [],
+    rows: [],
+  };
+  const livePlayerRows =
+    liveStats[`${activeLivePrefix}_players`]?.rows?.length ?? 0;
+  const activeLivePlayersTableState = livePlayersTableState[activeLiveSide];
+  const pbpCanApply = canApplyPbpAdvancedFilters(pbpAdvancedFiltersDraft);
+  const pbpFiltersDirty = !pbpAdvancedFiltersEqual(
+    pbpAdvancedFiltersDraft,
+    pbpAppliedFilters,
+  );
+  const positiveTeamTrends = trendsMessages.filter(
+    (message) => message.tone === "good",
+  );
+  const negativeTeamTrends = trendsMessages.filter(
+    (message) => message.tone !== "good",
+  );
+  const positivePlayerTrends = trendsPlayerMessages.filter(
+    (message) => message.tone === "good",
+  );
+  const negativePlayerTrends = trendsPlayerMessages.filter(
+    (message) => message.tone !== "good",
+  );
+  const basicTrendSections = [
+    {
+      key: "team-positive",
+      title: "Team Trends · Positive",
+      tone: "good",
+      items: positiveTeamTrends,
+      emptyText: "No positive team trends at the current checkpoint.",
+    },
+    {
+      key: "team-negative",
+      title: "Team Trends · Negative",
+      tone: "bad",
+      items: negativeTeamTrends,
+      emptyText: "No negative team trends at the current checkpoint.",
+    },
+    {
+      key: "player-positive",
+      title: "Individual Trends · Positive",
+      tone: "good",
+      items: positivePlayerTrends,
+      emptyText: "No positive individual trends at the current checkpoint.",
+    },
+    {
+      key: "player-negative",
+      title: "Individual Trends · Negative",
+      tone: "bad",
+      items: negativePlayerTrends,
+      emptyText: "No negative individual trends at the current checkpoint.",
+    },
+  ];
+  const pbpClockHint = useMemo(() => {
+    if (pbpAdvancedFiltersDraft.clockMode === "last_n" && !pbpCanApply) {
+      return "Enter minutes greater than 0 to apply.";
+    }
+    if (pbpAdvancedFiltersDraft.clockMode === "range" && !pbpCanApply) {
+      return "Enter From and To in MM:SS format.";
+    }
+    return "";
+  }, [pbpAdvancedFiltersDraft.clockMode, pbpCanApply]);
+  const pbpTeamOptions = useMemo(() => {
+    const opts = new Set(["UCSB", "Opponent"]);
+    for (const row of pbpData.rows) {
+      const value = String(row.team_id || "").trim();
+      if (value) {
+        opts.add(value);
+      }
+    }
+    for (const selected of pbpAdvancedFiltersDraft.teamIds) {
+      if (selected) {
+        opts.add(selected);
+      }
+    }
+    return Array.from(opts);
+  }, [pbpAdvancedFiltersDraft.teamIds, pbpData.rows]);
+
+  const pbpTypeOptions = useMemo(() => {
+    const opts = new Set();
+    for (const row of pbpData.rows) {
+      const value = String(row.type || "").trim();
+      if (value) {
+        opts.add(value);
+      }
+    }
+    for (const selected of pbpAdvancedFiltersDraft.types) {
+      if (selected) {
+        opts.add(selected);
+      }
+    }
+    return Array.from(opts).sort((a, b) => a.localeCompare(b));
+  }, [pbpAdvancedFiltersDraft.types, pbpData.rows]);
+  const pbpPeriodOptions = useMemo(() => {
+    const opts = new Set();
+    for (const row of pbpData.rows) {
+      const value = String(row.period || "").trim();
+      if (value) {
+        opts.add(value);
+      }
+    }
+    for (const selected of pbpAdvancedFiltersDraft.periods) {
+      if (selected) {
+        opts.add(selected);
+      }
+    }
+    return Array.from(opts).sort((a, b) => a.localeCompare(b));
+  }, [pbpAdvancedFiltersDraft.periods, pbpData.rows]);
+
+  const handleApplyPbpAdvancedFilters = useCallback(() => {
+    if (!canApplyPbpAdvancedFilters(pbpAdvancedFiltersDraft)) {
+      return;
+    }
+    setPbpAppliedFilters({ ...pbpAdvancedFiltersDraft });
+  }, [pbpAdvancedFiltersDraft]);
+
+  const handleClearPbpAdvancedFilters = useCallback(() => {
+    setPbpAdvancedFiltersDraft({ ...DEFAULT_PBP_ADVANCED_FILTERS });
+    setPbpAppliedFilters({ ...DEFAULT_PBP_ADVANCED_FILTERS });
+  }, []);
+
+  const sendSharedMessage = useCallback(async () => {
+    const nextText = sharedMessageDraft.trim();
+    if (!nextText || !profileUser) {
+      return;
+    }
+    setSharedNoteSaving(true);
+    setSharedNoteError("");
+    try {
+      const payload = await fetchJson(
+        `${API_BASE}/api/shared-note`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: nextText,
+            author_name: sharedMessageShowName ? profileUser.name || "" : "",
+            author_email: profileUser.email || "",
+          }),
+        },
+        1,
+      );
+      const nextMessages = Array.isArray(payload.messages)
+        ? payload.messages.map((message) => ({
+            id: String(message.id || ""),
+            text: String(message.text || ""),
+            authorName:
+              String(message.author_name || "") === "Anonymous"
+                ? ""
+                : String(message.author_name || ""),
+            authorEmail: String(message.author_email || ""),
+            createdAt: String(message.created_at || ""),
+          }))
+        : [];
+      const savedUpdatedAt = String(payload.updated_at || "");
+
+      setSharedMessages(nextMessages);
+      setSharedNoteUpdatedAt(savedUpdatedAt);
+      setSharedMessageDraft("");
+    } catch (error) {
+      setSharedNoteError(error.message);
+    } finally {
+      setSharedNoteSaving(false);
+    }
+  }, [profileUser, sharedMessageDraft, sharedMessageShowName]);
+
+  const handleSharedMessageSubmit = useCallback(
+    (event) => {
+      event.preventDefault();
+      sendSharedMessage();
+    },
+    [sendSharedMessage],
+  );
+
+
+  const pbpAdvancedControls = (
+    <details
+      className="pbp-advanced-panel"
+      open={pbpAdvancedOpen}
+      onToggle={(event) => setPbpAdvancedOpen(event.currentTarget.open)}
+    >
+      <summary className="pbp-advanced-summary">Advanced filters</summary>
+      <div className="pbp-advanced-filters">
+        <label>
+          Team
+          <select
+            className="compact-multi"
+            multiple
+            value={pbpAdvancedFiltersDraft.teamIds}
+            onChange={(event) =>
+              setPbpAdvancedFiltersDraft((prev) => ({
+                ...prev,
+                teamIds: Array.from(event.target.selectedOptions).map(
+                  (option) => option.value,
+                ),
+              }))
+            }
+          >
+            {pbpTeamOptions.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Type
+          <select
+            className="compact-multi"
+            multiple
+            value={pbpAdvancedFiltersDraft.types}
+            onChange={(event) =>
+              setPbpAdvancedFiltersDraft((prev) => ({
+                ...prev,
+                types: Array.from(event.target.selectedOptions).map(
+                  (option) => option.value,
+                ),
+              }))
+            }
+          >
+            {pbpTypeOptions.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Period
+          <select
+            className="compact-multi"
+            multiple
+            value={pbpAdvancedFiltersDraft.periods}
+            onChange={(event) =>
+              setPbpAdvancedFiltersDraft((prev) => ({
+                ...prev,
+                periods: Array.from(event.target.selectedOptions).map(
+                  (option) => option.value,
+                ),
+              }))
+            }
+          >
+            {pbpPeriodOptions.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="clock-filter-group">
+          <span>Clock</span>
+          <label>
+            <input
+              type="radio"
+              name="pbp-clock-mode"
+              checked={pbpAdvancedFiltersDraft.clockMode === "last_n"}
+              onChange={() =>
+                setPbpAdvancedFiltersDraft((prev) => ({
+                  ...prev,
+                  clockMode: "last_n",
+                  clockFrom: "",
+                  clockTo: "",
+                }))
+              }
+            />
+            Last N minutes
+          </label>
+          <label>
+            <input
+              type="radio"
+              name="pbp-clock-mode"
+              checked={pbpAdvancedFiltersDraft.clockMode === "range"}
+              onChange={() =>
+                setPbpAdvancedFiltersDraft((prev) => ({
+                  ...prev,
+                  clockMode: "range",
+                  clockLastNMinutes: "",
+                }))
+              }
+            />
+            Range
+          </label>
+          <label>
+            <input
+              type="radio"
+              name="pbp-clock-mode"
+              checked={!pbpAdvancedFiltersDraft.clockMode}
+              onChange={() =>
+                setPbpAdvancedFiltersDraft((prev) => ({
+                  ...prev,
+                  clockMode: "",
+                  clockLastNMinutes: "",
+                  clockFrom: "",
+                  clockTo: "",
+                }))
+              }
+            />
+            Off
+          </label>
+          {pbpAdvancedFiltersDraft.clockMode === "last_n" ? (
+            <input
+              type="number"
+              min="0"
+              step="0.1"
+              required
+              value={pbpAdvancedFiltersDraft.clockLastNMinutes}
+              placeholder="Minutes (e.g., 2.5)"
+              onChange={(event) =>
+                setPbpAdvancedFiltersDraft((prev) => ({
+                  ...prev,
+                  clockLastNMinutes: event.target.value,
+                }))
+              }
+            />
+          ) : null}
+          {pbpAdvancedFiltersDraft.clockMode === "range" ? (
+            <>
+              <input
+                type="text"
+                required
+                value={pbpAdvancedFiltersDraft.clockFrom}
+                placeholder="From MM:SS"
+                onChange={(event) =>
+                  setPbpAdvancedFiltersDraft((prev) => ({
+                    ...prev,
+                    clockFrom: event.target.value,
+                  }))
+                }
+              />
+              <input
+                type="text"
+                required
+                value={pbpAdvancedFiltersDraft.clockTo}
+                placeholder="To MM:SS"
+                onChange={(event) =>
+                  setPbpAdvancedFiltersDraft((prev) => ({
+                    ...prev,
+                    clockTo: event.target.value,
+                  }))
+                }
+              />
+            </>
+          ) : null}
+        </div>
+        {pbpClockHint ? (
+          <div className="pbp-inline-hint">{pbpClockHint}</div>
+        ) : null}
+        <button
+          type="button"
+          className="neutral apply-filters-btn"
+          onClick={handleApplyPbpAdvancedFilters}
+          disabled={!pbpCanApply || !pbpFiltersDirty}
+        >
+          Apply
+        </button>
+        <button
+          type="button"
+          className="neutral"
+          onClick={handleClearPbpAdvancedFilters}
+        >
+          Clear filters
+        </button>
+      </div>
+    </details>
+  );
+
+  const advancedTabOptions = [
+    { key: "gameData", label: "Game Data" },
+    { key: "trends", label: "Trends" },
+    { key: "sharedNotes", label: "Messages" },
+  ];
+  const showSeasonData = advancedTabs.seasonData;
+  const showGameData = advancedTabs.gameData;
+  const showTrends = advancedTabs.trends;
+  const showSharedNotes = advancedTabs.sharedNotes;
+  const showPlayerPerformance = advancedTabs.playerPerformance;
+  const hasAdvancedPanels =
+    showSeasonData ||
+    showGameData ||
+    showTrends ||
+    showSharedNotes ||
+    showPlayerPerformance;
+  const showGameHandle = showGameData && showSeasonData;
+  const showTrendsHandle = showTrends && (showSeasonData || showGameData);
+  const showSharedNotesHandle =
+    showSharedNotes && (showSeasonData || showGameData || showTrends);
+  const showPlayerPerformanceHandle =
+    showPlayerPerformance &&
+    (showSeasonData || showGameData || showTrends || showSharedNotes);
+
+  const sharedNoteStatus = sharedNoteLoading
+    ? "Loading messages..."
+    : sharedNoteSaving
+      ? "Sending..."
+      : sharedNoteUpdatedAt
+        ? `Updated ${new Date(sharedNoteUpdatedAt).toLocaleString()}`
+        : sharedMessages.length
+          ? `${sharedMessages.length} messages`
+          : "No messages yet.";
+
+  const sharedNotePanelBody = (
+    <>
+      <div className="table-status">
+        <span>{sharedNoteStatus}</span>
+        {sharedNoteError ? <span className="error"> {sharedNoteError}</span> : null}
+      </div>
+      <div className="shared-messages-body">
+        <div className="shared-messages-list" ref={sharedMessagesListRef}>
+          {sharedMessages.length ? (
+            sharedMessages.map((message, index) => (
+              <article
+                className="shared-message"
+                key={message.id || `${message.createdAt}-${index}`}
+              >
+                <div className="shared-message-content">
+                  <div className="shared-message-meta">
+                    {message.authorName ? <strong>{message.authorName}</strong> : null}
+                    {message.createdAt ? (
+                      <span>
+                        {new Date(message.createdAt).toLocaleTimeString(undefined, {
+                          hour: "numeric",
+                          minute: "2-digit",
+                        })}
+                      </span>
+                    ) : null}
+                  </div>
+                  <p>{message.text}</p>
+                </div>
+              </article>
+            ))
+          ) : (
+            <div className="shared-messages-empty">No messages yet.</div>
+          )}
+        </div>
+        {isAdvancedView ? (
+          <form className="shared-message-composer" onSubmit={handleSharedMessageSubmit}>
+            <div className="shared-message-composer-options">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={sharedMessageShowName}
+                  onChange={(event) => setSharedMessageShowName(event.target.checked)}
+                  disabled={!profileUser}
+                />
+                <span>Show name</span>
+              </label>
+              {!profileUser ? (
+                <span className="shared-message-login-required">
+                  Log in to send messages.
+                </span>
+              ) : null}
+            </div>
+            <textarea
+              value={sharedMessageDraft}
+              onChange={(event) => {
+                setSharedMessageDraft(event.target.value);
+                setSharedNoteError("");
+              }}
+              placeholder="Send a message..."
+              rows={3}
+              disabled={!profileUser}
+            />
+            <button
+              type="submit"
+              disabled={sharedNoteSaving || !sharedMessageDraft.trim() || !profileUser}
+            >
+              {sharedNoteSaving ? "Sending..." : "Send"}
+            </button>
+          </form>
+        ) : null}
+      </div>
+    </>
+  );
+
+  return (
+    <div className="app-shell">
+      <div className="top-app-bar">
+        <div className="top-app-bar-left">
+          <img src={logo} alt="Dashboard Logo" className="logo-slot" />
+          <h1>GSAC Basketball Live Analytics Dashboard</h1>
+          {isAdvancedView ? (
+            <div className="tabs-dropdown">
+              <button
+                type="button"
+                className="neutral tabs-dropdown-toggle"
+                onClick={() => setAdvancedTabsOpen((prev) => !prev)}
+                aria-haspopup="menu"
+                aria-expanded={advancedTabsOpen}
+                ref={advancedTabsButtonRef}
+              >
+                Tabs ▾
+              </button>
+              {advancedTabsOpen ? (
+                <div className="tabs-dropdown-menu" ref={advancedTabsMenuRef}>
+                  {advancedTabOptions.map((option) => (
+                    <label key={option.key} className="tabs-dropdown-item">
+                      <input
+                        type="checkbox"
+                        checked={advancedTabs[option.key]}
+                        onChange={(event) =>
+                          setAdvancedTabs((prev) => ({
+                            ...prev,
+                            [option.key]: event.target.checked,
+                          }))
+                        }
+                      />
+                      <span>{option.label}</span>
+                    </label>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+        {isAdvancedView ? (
+          <div className="top-app-bar-middle">
+            <div className="top-bar-controls">
+              <div className="top-bar-controls-main">
+                <label>
+                  <span className="label-inline">Game:</span>
+                  <select
+                    value={pbpGameId}
+                    onChange={(event) => setPbpGameId(event.target.value)}
+                    disabled={pbpUpdating || trendsUpdating}
+                  >
+                    {pbpGameOptions.length ? (
+                      pbpGameOptions.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))
+                    ) : (
+                      <option value={pbpGameId}>Loading 2026-27 games...</option>
+                    )}
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  onClick={updatePbp}
+                  disabled={pbpUpdating || trendsUpdating || pbpAutoRefreshEnabled}
+                >
+                  {pbpUpdating ? "Refreshing..." : "Refresh"}
+                </button>
+                <div className="top-bar-auto-refresh">
+                  <button
+                    type="button"
+                    className="neutral auto-refresh-toggle"
+                    onClick={() => setTopBarAutoRefreshOpen((prev) => !prev)}
+                    aria-haspopup="menu"
+                    aria-expanded={topBarAutoRefreshOpen}
+                    aria-label={
+                      pbpAutoRefreshEnabled
+                        ? `Auto refresh every ${pbpAutoRefreshSeconds} seconds`
+                        : "Auto refresh settings"
+                    }
+                    title="Auto refresh settings"
+                    ref={topBarAutoRefreshButtonRef}
+                  >
+                    {pbpAutoRefreshEnabled ? (
+                      <span>{pbpAutoRefreshSeconds}s</span>
+                    ) : null}
+                    <span aria-hidden="true">{topBarAutoRefreshOpen ? "▴" : "▾"}</span>
+                  </button>
+                  {topBarAutoRefreshOpen ? (
+                    <div
+                      className="top-bar-auto-refresh-menu"
+                      ref={topBarAutoRefreshMenuRef}
+                    >
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={pbpAutoRefreshEnabled}
+                          onChange={(event) =>
+                            setPbpAutoRefreshEnabled(event.target.checked)
+                          }
+                        />
+                        <span>Auto Refresh every</span>
+                      </label>
+                      <input
+                        type="number"
+                        min="1"
+                        step="1"
+                        value={pbpAutoRefreshSeconds}
+                        onChange={(event) => {
+                          const nextValue = Number(event.target.value);
+                          setPbpAutoRefreshSeconds(
+                            Number.isFinite(nextValue) && nextValue > 0
+                              ? nextValue
+                              : 1,
+                          );
+                        }}
+                        disabled={!pbpAutoRefreshEnabled}
+                      />
+                      <span>seconds</span>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : null}
+        <div className="top-app-bar-right">
+          <div className="top-bar-controls-main">
+            <span className="label-inline">View:</span>
+            <div className="game-data-subtabs">
+              <button
+                type="button"
+                className={activeView === "dataViz" ? "active" : ""}
+                onClick={() => setActiveView("dataViz")}
+              >
+                Data Viz
+              </button>
+              <button
+                type="button"
+                className={activeView === "advanced" ? "active" : ""}
+                onClick={() => setActiveView("advanced")}
+              >
+                Advanced
+              </button>
+              <button
+                type="button"
+                className={activeView === "basic" ? "active" : ""}
+                onClick={() => setActiveView("basic")}
+              >
+                Basic
+              </button>
+            </div>
+          </div>
+          <div className="profile-menu">
+            <button
+              type="button"
+              className="profile-menu-toggle"
+              onClick={() => setProfileMenuOpen((prev) => !prev)}
+              aria-haspopup="menu"
+              aria-expanded={profileMenuOpen}
+              aria-label="Profile menu"
+              title={profileUser ? profileUser.name : "Anonymous profile"}
+              ref={profileMenuButtonRef}
+            >
+              {profileUser?.picture ? (
+                <img src={profileUser.picture} alt="" />
+              ) : (
+                <span aria-hidden="true">?</span>
+              )}
+            </button>
+            {profileMenuOpen ? (
+              <div className="profile-menu-dropdown" ref={profileMenuRef}>
+                <div className="profile-menu-status">
+                  <strong>{profileUser?.name || "Anonymous"}</strong>
+                  {profileUser?.email ? <span>{profileUser.email}</span> : null}
+                </div>
+                {profileUser ? (
+                  <button
+                    type="button"
+                    className="profile-menu-item neutral"
+                    onClick={handleProfileLogout}
+                  >
+                    Log out
+                  </button>
+                ) : GOOGLE_CLIENT_ID ? (
+                  <div className="google-sign-in-button" ref={googleSignInButtonRef}>
+                    {googleAuthError ? <span>{googleAuthError}</span> : null}
+                  </div>
+                ) : (
+                  <span className="profile-menu-help">
+                    Add VITE_GOOGLE_CLIENT_ID to enable Google login.
+                  </span>
+                )}
+              </div>
+            ) : null}
+          </div>
+        </div>
+      </div>
+      {isAdvancedView ? (
+        hasAdvancedPanels ? (
+          <PanelGroup direction="horizontal" key="advanced-view">
+            {showGameData ? (
+              <Panel
+                key="game-data"
+                ref={gameDataPanelRef}
+                defaultSize={25}
+                minSize={22}
+                collapsible
+                collapsedSize={4}
+                onCollapse={() => setGameDataCollapsed(true)}
+                onExpand={() => setGameDataCollapsed(false)}
+              >
+                <div className="panel game-panel">
+                  {gameDataCollapsed ? (
+                    <div
+                      className="panel-collapsed"
+                      onClick={() => gameDataPanelRef.current?.expand()}
+                    >
+                      <span>Game Data</span>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="section-header">
+                        <h2>Game Data</h2>
+                        <div className="game-data-subtabs">
+                          <button
+                            type="button"
+                            className={gameDataSubtab === "live-stats" ? "active" : ""}
+                            onClick={() => setGameDataSubtab("live-stats")}
+                          >
+                            Live Stats
+                          </button>
+                          <button
+                            type="button"
+                            className={gameDataSubtab === "play-by-play" ? "active" : ""}
+                            onClick={() => setGameDataSubtab("play-by-play")}
+                          >
+                            Play by Play
+                          </button>
+                          <button
+                            type="button"
+                            className={gameDataSubtab === "season-data" ? "active" : ""}
+                            onClick={() => setGameDataSubtab("season-data")}
+                          >
+                            Season Data
+                          </button>
+                        </div>
+                        <div className="panel-header-actions">
+                          <CollapseButton
+                            panelRef={gameDataPanelRef}
+                            collapsed={gameDataCollapsed}
+                            onCollapsedChange={setGameDataCollapsed}
+                            title="Game Data"
+                          />
+                        </div>
+                      </div>
+                      {gameDataSubtab === "live-stats" ? (
+                        <>
+                          <div className="tab-tree live-stats-tree">
+                            <div className="branch">
+                              <h3>Team View</h3>
+                              <div className="leaf-list">
+                                <button type="button" className={`leaf ${activeLiveSide === "ucsb" ? "active" : ""}`} onClick={() => setActiveLiveSide("ucsb")}>
+                                  UCSB
+                                </button>
+                                <button
+                                  type="button"
+                                  className={`leaf ${activeLiveSide === "opponent" ? "active" : ""}`}
+                                  onClick={() => setActiveLiveSide("opponent")}
+                                  disabled={!normalizedOpponentTeamId}
+                                >
+                                  Opponent
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="table-status">
+                            {liveStatsLoading ? <span> Loading live stats...</span> : null}
+                            {liveStatsError ? <span className="error"> {liveStatsError}</span> : null}
+                            {!pbpData.rows.length ? (
+                              <span> Live stats are derived from play-by-play data. Click Update above to fetch PBP first.</span>
+                            ) : (
+                              <span> Derived from play-by-play ({pbpData.rows.length} plays).</span>
+                            )}
+                          </div>
+                          <div className="table-status">
+                            <span>
+                              {activeLiveSide === "ucsb" ? "UCSB" : "Opponent"} live player rows: {livePlayerRows}
+                            </span>
+                            <span style={{ marginLeft: "20px", marginRight: "10px" }}>
+                              Highlight Performance:
+                            </span>
+                            <select
+                              value={performanceMetric}
+                              onChange={(e) => setPerformanceMetric(e.target.value)}
+                              style={{ padding: "4px", borderRadius: "4px" }}
+                            >
+                              <option value="PTS">Points (PTS)</option>
+                              <option value="REB">Rebounds (REB)</option>
+                              <option value="AST">Assists (AST)</option>
+                              <option value="PIE">Player Impact(PIE)</option>
+                            </select>
+                          </div>
+                          <DataTable
+                            columns={livePlayersData.columns}
+                            rows={livePlayersData.rows}
+                            state={activeLivePlayersTableState}
+                            onRowClick={handlePlayerRowClick}
+                            onChange={(patch) =>
+                              setLivePlayersTableState((prev) => ({
+                                ...prev,
+                                [activeLiveSide]: {
+                                  ...prev[activeLiveSide],
+                                  ...patch
+                                }
+                              }))
+                            }
+                            getRowStyle={(row) => {
+                              try {
+                                const playerName = row["Player"];
+                                if (!playerName) return {};
+
+                                if (performanceMetric === "PIE") {
+                                  const pieString = row["PIE"] || "0%";
+                                  const pieValue = parseFloat(pieString) / 100;
+
+                                  if (pieValue >= 0.12) {
+                                    return { backgroundColor: "rgba(0, 255, 0, 0.3)" };
+                                  } else if (pieValue <= 0.05 && pieValue > 0) {
+                                    return { backgroundColor: "rgba(255, 0, 0, 0.2)" };
+                                  }
+                                  else if (pieValue < 0) {
+                                    return { backgroundColor: "rgba(255, 0, 0, 0.2)" };
+                                  }
+                                  return {};
+                                }
+                                const seasonTeamRows = seasonPlayers[activeLiveSide].rows;
+                                const seasonPlayer = seasonTeamRows.find((p) => {
+                                  const seasonName = p["Player"];
+                                  if (!seasonName) return false;
+
+                                  if (seasonName.includes(",")) {
+                                    const [lastName, firstName] = seasonName.split(",").map(s => s.trim());
+                                    const flippedName = `${firstName} ${lastName}`;
+                                    return flippedName === playerName;
+                                  }
+
+                                  return seasonName === playerName;
+                                });
+
+                                const statMapping = {
+                                  "PTS": "PPG",
+                                  "REB": "RPG",
+                                  "AST": "APG"
+                                };
+
+                                const seasonStatsKey = statMapping[performanceMetric];
+
+                                if (seasonPlayer && seasonPlayer[seasonStatsKey]) {
+                                  const liveValue = parseFloat(row[performanceMetric]) || 0;
+                                  const liveMin = parseFloat(row["MIN"]) || 0;
+                                  const seasonAvgValue = parseFloat(seasonPlayer[seasonStatsKey]);
+
+                                  const seasonTotalMin = parseFloat(seasonPlayer["MIN"]) || 0;
+                                  const gpString = seasonPlayer["GP-GS"] || "";
+                                  const gp = parseFloat(gpString.split("-")[0]) || 0;
+                                  const seasonMpg = gp > 0 ? seasonTotalMin / gp : 0;
+
+                                  if (liveMin > 0 && seasonMpg > 0) {
+                                    const projectedVal = (liveValue / liveMin) * seasonMpg;
+
+                                    let threshold = .25;
+                                    if (performanceMetric === "REB") {
+                                      threshold = .35;
+                                    } else if (performanceMetric === "AST") {
+                                      threshold = .35;
+                                    }
+
+                                    const color = getPerformanceColor(
+                                      projectedVal,
+                                      seasonAvgValue,
+                                      threshold,
+                                    );
+
+                                    if (color) {
+                                      return { backgroundColor: color };
+                                    }
+                                  }
+                                }
+                              } catch (error) {
+                                console.error("Cant change color", error);
+                              }
+
+                              return {};
+                            }}
+                          />
+                        </>
+                      ) : gameDataSubtab === "play-by-play" ? (
+                        <>
+                          <div className="table-status">
+                            {pbpError ? (
+                              <span className="error"> {pbpError}</span>
+                            ) : null}
+                            {!pbpLoading && !pbpError && pbpData.rows.length ? (
+                              <span> Rows: {pbpData.rows.length}</span>
+                            ) : null}
+                            {!pbpLoading && !pbpError && pbpData.source_url ? (
+                              <span>
+                                {" "}
+                                Source:{" "}
+                                <a
+                                  href={pbpData.source_url}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                >
+                                  ESPN Core API
+                                </a>
+                              </span>
+                            ) : null}
+                          </div>
+                          <DataTable
+                            columns={pbpData.columns}
+                            rows={pbpData.rows}
+                            state={pbpTableState}
+                            onChange={(patch) =>
+                              setPbpTableState((prev) => ({ ...prev, ...patch }))
+                            }
+                            extraControls={pbpAdvancedControls}
+                          />
+                        </>
+                      ) : gameDataSubtab === "season-data" ? (
+                        <>
+                          <div className="team-line opponent-line">
+                            {espnTeams.length > 0 ? (
+                              <select value={opponentTeamId} onChange={(e) => setOpponentTeamId(e.target.value)}>
+                                <option value="">Select ESPN team</option>
+                                {espnTeams
+                                  .filter((team) => {
+                                    const id = normalizeTeamIdInput(team.team_id);
+                                    return id !== UCSB_TEAM_ID && BIG_WEST_TEAM_IDS.has(id);
+                                  })
+                                  .map((team) => (
+                                    <option key={team.team_id} value={team.team_id}>
+                                      {team.school_name} ({team.team_id})
+                                    </option>
+                                  ))}
+                              </select>
+                            ) : (
+                              <input
+                                type="text"
+                                value={opponentTeamId}
+                                placeholder="Team ID (e.g., ucr)"
+                                onChange={(event) => setOpponentTeamId(event.target.value)}
+                              />
+                            )}
+                          </div>
+
+                          <div className="tab-tree">
+                            <div className="branch">
+                              <h3>Team View</h3>
+                              <div className="leaf-list">
+                                <button
+                                  type="button"
+                                  className={`leaf ${activeSeasonSide === "ucsb" ? "active" : ""}`}
+                                  onClick={() => setActiveSeasonSide("ucsb")}
+                                >
+                                  UCSB
+                                </button>
+                                <button
+                                  type="button"
+                                  className={`leaf ${activeSeasonSide === "opponent" ? "active" : ""}`}
+                                  onClick={() => setActiveSeasonSide("opponent")}
+                                >
+                                  Opponent
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="table-status">
+                            {activeSeasonPlayersLoading ? (
+                              <span> Loading season players...</span>
+                            ) : null}
+                            {activeSeasonPlayersError ? (
+                              <span className="error"> {activeSeasonPlayersError}</span>
+                            ) : null}
+                            {teamsLoading ? <span> Loading ESPN teams...</span> : null}
+                            {teamsError ? (
+                              <span className="error"> {teamsError}</span>
+                            ) : null}
+                            {activeSeasonSide === "opponent" &&
+                              !normalizedOpponentTeamId ? (
+                              <span> Select an opponent team to view opponent data.</span>
+                            ) : null}
+                          </div>
+
+                          <DataTable
+                            columns={activeSeasonPlayers.columns}
+                            rows={activeSeasonPlayers.rows}
+                            state={activeSeasonPlayersTableState}
+                            onChange={(patch) =>
+                              setSeasonPlayersTableState((prev) => ({
+                                ...prev,
+                                [activeSeasonSide]: {
+                                  ...prev[activeSeasonSide],
+                                  ...patch,
+                                },
+                              }))
+                            }
+                          />
+                        </>
+                      ) : null}
+                    </>
+                  )}
+                </div>
+              </Panel>
+            ) : null}
+
+            {showTrendsHandle ? (
+              <PanelResizeHandle
+                key="handle-game-trends"
+                className="resize-handle vertical"
+              />
+            ) : null}
+
+            {showTrends ? (
+              <Panel
+                key="trends"
+                ref={trendsPanelRef}
+                defaultSize={20}
+                minSize={14}
+                collapsible
+                collapsedSize={4}
+                onCollapse={() => setTrendsCollapsed(true)}
+                onExpand={() => setTrendsCollapsed(false)}
+              >
+                <div className="panel trends-panel">
+                  {trendsCollapsed ? (
+                    <div
+                      className="panel-collapsed"
+                      onClick={() => trendsPanelRef.current?.expand()}
+                    >
+                      <span>Trends</span>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="section-header">
+                        <h2>Trends</h2>
+                        <span>Teams and players trending now</span>
+                        <CollapseButton
+                          panelRef={trendsPanelRef}
+                          collapsed={trendsCollapsed}
+                          onCollapsedChange={setTrendsCollapsed}
+                          title="Trends"
+                        />
+                      </div>
+                      <div className="table-status">
+                        <button
+                          type="button"
+                          onClick={updateTrends}
+                          disabled={trendsUpdating}
+                        >
+                          {trendsUpdating ? "Updating..." : "Update Trends"}
+                        </button>
+                        {trendsUpdatedAt ? (
+                          <span>
+                            {" "}
+                            Updated {new Date(trendsUpdatedAt).toLocaleString()}
+                          </span>
+                        ) : (
+                          <span> No trends snapshot yet.</span>
+                        )}
+                        {trendsError ? (
+                          <span className="error"> {trendsError}</span>
+                        ) : null}
+                      </div>
+                      <div className="table-status trends-threshold-controls">
+                        <label>
+                          Over threshold multiplier
+                          <input
+                            type="range"
+                            min="1"
+                            max="5"
+                            step="0.05"
+                            value={trendsOverMultiplier}
+                            onChange={(event) =>
+                              setTrendsOverMultiplier(Number(event.target.value))
+                            }
+                          />
+                          <span>x{trendsOverMultiplier.toFixed(2)}</span>
+                        </label>
+                        <label>
+                          Under threshold multiplier
+                          <input
+                            type="range"
+                            min="0.1"
+                            max="1"
+                            step="0.05"
+                            value={trendsUnderMultiplier}
+                            onChange={(event) =>
+                              setTrendsUnderMultiplier(Number(event.target.value))
+                            }
+                          />
+                          <span>x{trendsUnderMultiplier.toFixed(2)}</span>
+                        </label>
+                      </div>
+                      <div className="table-status">
+                        <span>Checkpoint: {trendsCheckpointLabel}</span>
+                      </div>
+                      <div className="table-status">
+                        <span>
+                          Tracked teams: {Object.keys(trendsTimelines).length}
+                        </span>
+                      </div>
+                      <div className="table-status">
+                        {trendsMessages.length ? (
+                          <span>Messages: {trendsMessages.length}</span>
+                        ) : (
+                          <span>
+                            No over/under messages at the current checkpoint.
+                          </span>
+                        )}
+                      </div>
+                      <div className="table-scroll">
+                        {trendsMessages.length ? (
+                          <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+                            {trendsMessages.map((message, index) => (
+                              <li
+                                key={`trend_message_${index}`}
+                                style={{
+                                  backgroundColor:
+                                    message.tone === "good"
+                                      ? "rgba(34, 197, 94, 0.18)"
+                                      : "rgba(239, 68, 68, 0.18)",
+                                  border:
+                                    message.tone === "good"
+                                      ? "1px solid rgba(34, 197, 94, 0.5)"
+                                      : "1px solid rgba(239, 68, 68, 0.5)",
+                                  borderRadius: "0",
+                                  padding: "8px 10px",
+                                  marginBottom: "0",
+                                  fontSize: "12px",
+                                }}
+                              >
+                                {message.text}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : null}
+                      </div>
+                      <div className="table-scroll">
+                        {trendsPlayerMessages.length ? (
+                          <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+                            {trendsPlayerMessages.map((message, index) => (
+                              <li
+                                key={`trend_player_message_${index}`}
+                                style={{
+                                  backgroundColor:
+                                    message.tone === "good"
+                                      ? "rgba(34, 197, 94, 0.18)"
+                                      : "rgba(239, 68, 68, 0.18)",
+                                  border:
+                                    message.tone === "good"
+                                      ? "1px solid rgba(34, 197, 94, 0.5)"
+                                      : "1px solid rgba(239, 68, 68, 0.5)",
+                                  borderRadius: "0",
+                                  padding: "8px 10px",
+                                  marginBottom: "0",
+                                  fontSize: "12px",
+                                }}
+                              >
+                                {message.text}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <span>No individual trends at the current checkpoint.</span>
+                        )}
+                      </div>
+                    </>
+                  )}
+                </div>
+              </Panel>
+            ) : null}
+
+            {showSharedNotesHandle ? (
+              <PanelResizeHandle
+                key="handle-trends-notes"
+                className="resize-handle vertical"
+              />
+            ) : null}
+
+            {showSharedNotes ? (
+              <Panel
+                key="shared-notes"
+                ref={savedPanelRef}
+                defaultSize={15}
+                minSize={12}
+                collapsible
+                collapsedSize={4}
+                onCollapse={() => setSavedCollapsed(true)}
+                onExpand={() => setSavedCollapsed(false)}
+              >
+                {savedCollapsed ? (
+                  <div
+                    className="panel-collapsed"
+                    onClick={() => savedPanelRef.current?.expand()}
+                  >
+                    <span>Messages</span>
+                  </div>
+                ) : (
+                  <div className="insights-column">
+                    <div className="insights-column-header">
+                      <span>Messages</span>
+                      <CollapseButton
+                        panelRef={savedPanelRef}
+                        collapsed={savedCollapsed}
+                        onCollapsedChange={setSavedCollapsed}
+                        title="Messages"
+                      />
+                    </div>
+                    {sharedNotePanelBody}
+                  </div>
+                )}
+              </Panel>
+            ) : null}
+
+
+
+          </PanelGroup>
+        ) : (
+          <PanelGroup direction="horizontal" key="advanced-view-empty">
+            <Panel defaultSize={100} minSize={40}>
+              <div className="panel empty-panel">
+                <div className="section-header">
+                  <h2>Advanced View</h2>
+                </div>
+                <p className="placeholder">
+                  Select tabs from the top menu to show panels.
+                </p>
+              </div>
+            </Panel>
+          </PanelGroup>
+        )
+      ) : isBasicView ? (
+        <PanelGroup direction="horizontal" className="basic-view-shell" key="basic-view">
+          <Panel defaultSize={68} minSize={40}>
+            <div className="panel trends-panel">
+              <div className="section-header">
+                <h2>Trends</h2>
+                <span>Teams and players trending now</span>
+              </div>
+              <div className="table-status">
+                <button type="button" onClick={updateTrends} disabled={trendsUpdating}>
+                  {trendsUpdating ? "Updating..." : "Update Trends"}
+                </button>
+                {trendsUpdatedAt ? (
+                  <span> Updated {new Date(trendsUpdatedAt).toLocaleString()}</span>
+                ) : (
+                  <span> No trends snapshot yet.</span>
+                )}
+                {trendsError ? <span className="error"> {trendsError}</span> : null}
+              </div>
+              <div className="table-status trends-auto-update">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={basicTrendsAutoUpdate}
+                    onChange={(event) =>
+                      setBasicTrendsAutoUpdate(event.target.checked)
+                    }
+                  />
+                  Auto update every
+                </label>
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={basicTrendsAutoSeconds}
+                  onChange={(event) => {
+                    const nextValue = Number(event.target.value);
+                    setBasicTrendsAutoSeconds(
+                      Number.isFinite(nextValue) && nextValue > 0
+                        ? nextValue
+                        : 1,
+                    );
+                  }}
+                  disabled={!basicTrendsAutoUpdate}
+                />
+                <span>seconds</span>
+              </div>
+              <div className="table-status trends-threshold-controls">
+                <label>
+                  Over threshold multiplier
+                  <input
+                    type="range"
+                    min="1"
+                    max="5"
+                    step="0.05"
+                    value={trendsOverMultiplier}
+                    onChange={(event) =>
+                      setTrendsOverMultiplier(Number(event.target.value))
+                    }
+                  />
+                  <span>x{trendsOverMultiplier.toFixed(2)}</span>
+                </label>
+                <label>
+                  Under threshold multiplier
+                  <input
+                    type="range"
+                    min="0.1"
+                    max="1"
+                    step="0.05"
+                    value={trendsUnderMultiplier}
+                    onChange={(event) =>
+                      setTrendsUnderMultiplier(Number(event.target.value))
+                    }
+                  />
+                  <span>x{trendsUnderMultiplier.toFixed(2)}</span>
+                </label>
+              </div>
+              <div className="table-status">
+                <span>Checkpoint: {trendsCheckpointLabel}</span>
+              </div>
+              <div className="table-scroll basic-trends-merged">
+                {basicTrendSections.map((section) => (
+                  <div key={section.key} className="basic-trends-section">
+                    <div className="basic-trends-section-title">
+                      {section.title}
+                    </div>
+                    {section.items.length ? (
+                      <ul className="basic-trends-list">
+                        {section.items.map((message, index) => (
+                          <li
+                            key={`${section.key}_${index}`}
+                            className={`basic-trends-item ${section.tone === "good" ? "positive" : "negative"
+                              }`}
+                          >
+                            {message.text}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <div className="basic-trends-empty">{section.emptyText}</div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </Panel>
+          <PanelResizeHandle className="resize-handle vertical" />
+          <Panel defaultSize={32} minSize={22}>
+            <div className="panel shared-note-basic-panel">
+              <div className="section-header">
+                <h2>Messages</h2>
+              </div>
+              {sharedNotePanelBody}
+            </div>
+          </Panel>
+        </PanelGroup>
+      ) : isDataVizView ? (
+        <div className="data-viz-view-shell" key="data-viz-view" style={{ display: "flex", flexDirection: "column", gap: "16px", height: "100%", overflowY: "auto" }}>
+          <PanelGroup direction="horizontal" style={{ minHeight: 0, flex: "0 0 auto", height: "600px" }}>
+            <Panel defaultSize={68} minSize={40}>
+            <div className="panel player-performance-panel">
+              <div className="section-header">
+                <h2>Player Performance</h2>
+              </div>
+
+              <div
+                className="panel story-panel"
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  height: "100%",
+                }}
+              >
+
+                <div
+                  style={{
+                    padding: "15px",
+                    borderBottom: "1px solid #eee",
+                  }}
+                >
+                  <label
+                    style={{
+                      fontSize: "12px",
+                      fontWeight: "bold",
+                      display: "block",
+                      marginBottom: "5px",
+                    }}
+                  >
+                    SELECT PLAYER
+                  </label>
+                  <select
+                    style={{ width: "100%", padding: "8px" }}
+                    value={selectedStoryPlayerOneId}
+                    onChange={(e) =>
+                      setSelectedStoryPlayerOneId(e.target.value)
+                    }
+                  >
+                    <option value="">Choose a player...</option>
+                    {allPlayersList.map((player) => (
+                      <option key={player.id} value={player.id}>
+                        {player.name} (
+                        {player.team_id === UCSB_TEAM_ID
+                          ? "UCSB"
+                          : activeGameOpponentName || resolveTeamName(player.team_id)}
+                        )
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div style={{ flex: 1, overflowY: "auto" }}>
+                  {(() => {
+                    const selectedPlayer = allPlayersList.find(
+                      (p) => p.id === selectedStoryPlayerOneId,
+                    );
+                    return (
+                      <PlayerPerformanceStory
+                        playerTimeline={buildCustomPlayerTimeline(
+                          pbpData.rows,
+                          selectedStoryPlayerOneId,
+                          selectedPlayer?.name,
+                          selectedPlayer?.team_id,
+                        )}
+                        teamName={resolveTeamName(
+                          selectedPlayer?.team_id,
+                        )}
+                      />
+                    );
+                  })()}
+                </div>
+              </div>
+            </div>
+          </Panel>
+          <Panel defaultSize={68} minSize={40}>
+            <div style={{ flex: 1, overflowY: "auto" }}>
+              <TeamPieComparison
+                liveStats={liveStats[`${activeLivePrefix}_players`]}
+                teamName={
+                  activeLiveSide === "ucsb"
+                    ? ucsbDisplayName
+                    : activeGameOpponentName
+                }
+              />
+            </div>
+          </Panel>
+          <Panel defaultSize={68} minSize={40}>
+            <div className="panel player-war-panel">
+              <div className="section-header">
+                <h2>Player Wars </h2>
+              </div>
+              <div
+                style={{
+                  padding: "15px",
+                  borderBottom: "1px solid #eee",
+                }}
+              >
+                <label
+                  style={{
+                    fontSize: "12px",
+                    fontWeight: "bold",
+                    display: "block",
+                    marginBottom: "5px",
+                  }}
+                >
+                  SELECT UCSB PLAYER
+                </label>
+                <select
+                  style={{ width: "100%", padding: "8px" }}
+                  value={selectedStoryPlayerOneId}
+                  onChange={(e) =>
+                    setSelectedStoryPlayerOneId(e.target.value)
+                  }
+                >
+                  <option value="">Choose a UCSB player...</option>
+                  {ucsbAvailablePlayers.map((player) => (
+                    <option key={player.id} value={player.id}>
+                      {player.name} (UCSB)
+                    </option>
+                  ))}
+                </select>
+
+                <label
+                  style={{
+                    fontSize: "12px",
+                    fontWeight: "bold",
+                    display: "block",
+                    marginBottom: "5px",
+                  }}
+                >
+                  SELECT OPPONENT PLAYER
+                </label>
+                <select
+                  style={{ width: "100%", padding: "8px" }}
+                  value={selectedStoryPlayerTwoId}
+                  onChange={(e) =>
+                    setSelectedStoryPlayerTwoId(e.target.value)
+                  }
+                >
+                  <option value="">Choose an opponent player...</option>
+                  {oppAvailablePlayers.map((player) => (
+                    <option key={player.id} value={player.id}>
+                      {player.name} ({activeGameOpponentName})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div style={{ flex: 1, overflowY: "auto" }}>
+                {(() => {
+                  const playerOne = allPlayersList.find(
+                    (p) => p.id === selectedStoryPlayerOneId,
+                  );
+                  const playerTwo = allPlayersList.find(
+                    (p) => p.id === selectedStoryPlayerTwoId,
+                  );
+                  const playerOneTimeline = buildCustomPlayerTimeline(
+                    pbpData.rows,
+                    selectedStoryPlayerOneId,
+                    playerOne?.name,
+                    playerOne?.team_id,
+                  );
+                  const playerTwoTimeline = buildCustomPlayerTimeline(
+                    pbpData.rows,
+                    selectedStoryPlayerTwoId,
+                    playerTwo?.name,
+                    playerTwo?.team_id,
+                  );
+                  const comparisonTimeline = buildWarTimeline(
+                    playerOneTimeline,
+                    playerTwoTimeline,
+                    playerOne?.name,
+                    playerTwo?.name,
+                  );
+                  return (
+                    <PlayerPerformanceStory
+                      playerTimeline={comparisonTimeline}
+                      teamName="Positive = UCSB, Negative = Opponent"
+                    />
+                  );
+                })()}
+              </div>
+            </div>
+          </Panel>
+        </PanelGroup>
+
+        {/* Shot Heatmap — full width below */}
+        <div className="panel" style={{ flexShrink: 0 }}>
+          <div className="section-header">
+            <h2>Shot Heatmap</h2>
+          </div>
+          <div style={{ maxHeight: "700px", overflowY: "auto" }}>
+            <Heatmap gameId={pbpGameId} />
+          </div>
+        </div>
+
+        {/* Score Differential Timeline — full width below heatmap */}
+        <div className="panel" style={{ flexShrink: 0 }}>
+          <div className="section-header">
+            <h2>Score Differential Timeline</h2>
+            <span className="muted">Lead/deficit across every scoring play</span>
+          </div>
+          {pbpGameOptions.length > 0 && (
+            <div style={{ display: "flex", gap: 6, padding: "6px 16px 0", flexWrap: "wrap" }}>
+              {pbpGameOptions.map((opt) => (
+                <button
+                  key={opt.value}
+                  type="button"
+                  className={scoreDiffGameId === opt.value ? "active" : "neutral"}
+                  style={{ fontSize: "0.82rem", padding: "3px 10px" }}
+                  onClick={() => setScoreDiffGameId(opt.value)}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          )}
+          <ScoreDifferentialChart
+            rows={scoreDiffRows ?? pbpData.rows}
+            ucsbTeamId={UCSB_TEAM_ID}
+            ucsbName={ucsbDisplayName}
+            opponentName={(() => {
+              const opt = pbpGameOptions.find((o) => o.value === scoreDiffGameId);
+              if (opt && opt.opponentName) {
+                return opt.opponentName;
+              }
+              if (opt && opt.label) {
+                const ucsbNames = ["uc santa barbara", "ucsb"];
+                
+                const atParts = opt.label.split(/\s+at\s+|\s*@\s*/i);
+                if (atParts.length === 2) {
+                  const isAwayUcsb = ucsbNames.some(n => atParts[0].toLowerCase().includes(n));
+                  return isAwayUcsb ? atParts[1].trim() : atParts[0].trim();
+                }
+                
+                const vsParts = opt.label.split(/\s+vs\.?\s*/i);
+                if (vsParts.length === 2) {
+                  const isAwayUcsb = ucsbNames.some(n => vsParts[0].toLowerCase().includes(n));
+                  return isAwayUcsb ? vsParts[1].trim() : vsParts[0].trim();
+                }
+
+                let fallbackName = opt.label
+                  .replace(/uc santa barbara/ig, "")
+                  .replace(/ucsb/ig, "")
+                  .replace(/\s+at\s+|\s*@\s*/ig, "")
+                  .replace(/\s+vs\.?\s*/ig, "")
+                  .trim();
+                if (fallbackName) return fallbackName;
+              }
+
+              if (opt) {
+                const oppId = opt.opponentTeamId;
+                const normalizedOppId = oppId ? normalizeTeamIdInput(oppId) : null;
+                if (normalizedOppId && teamNameById[normalizedOppId]) {
+                  return teamNameById[normalizedOppId];
+                }
+              }
+
+              const rowsToScan = scoreDiffRows ?? pbpData.rows ?? [];
+              let oppIdFromRows = null;
+              for (const r of rowsToScan) {
+                const rId = String(r.team_id || "").trim().toLowerCase();
+                const uId = String(UCSB_TEAM_ID).trim().toLowerCase();
+                if (rId && rId !== uId && rId !== "ucsb" && rId !== "2540") {
+                  oppIdFromRows = rId;
+                  break;
+                }
+              }
+              const normOppRows = oppIdFromRows ? normalizeTeamIdInput(oppIdFromRows) : null;
+              if (normOppRows && teamNameById[normOppRows]) {
+                return teamNameById[normOppRows];
+              }
+              return opponentDisplayName;
+            })()}
+          />
+        </div>
+        </div>
+
+      ) : null}
+
+      {selectedModalPlayer && (
+        <div style={{
+          position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+          backgroundColor: 'rgba(0,0,0,0.6)', display: 'flex',
+          alignItems: 'center', justifyContent: 'center', zIndex: 9999
+        }}>
+          <div style={{
+            backgroundColor: 'var(--panel-strong)', padding: '20px', borderRadius: '8px',
+            width: '500px', maxWidth: '90%', color: 'var(--ink)', boxShadow: '0 4px 12px rgba(0,0,0,0.3)'
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px', borderBottom: '1px solid var(--border)', paddingBottom: '10px' }}>
+              <h3 style={{ margin: 0, fontSize: '1.2rem', fontWeight: 800 }}>{selectedModalPlayer} - Last 5 Games</h3>
+              <button
+                onClick={closePlayerModal}
+                style={{ background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '1.2rem', color: 'var(--muted)', fontWeight: 'bold' }}
+              >
+                X
+              </button>
+            </div>
+
+            {isModalLoading ? (
+              <div style={{ textAlign: 'center', padding: '30px', color: 'var(--muted)' }}>
+                Loading game log...
+              </div>
+            ) : recentGames.length > 0 ? (
+              <table className="last-5-table" style={{ width: '100%', textAlign: 'left', borderCollapse: 'collapse', fontSize: '0.9rem' }}>
+                <thead>
+                  <tr style={{ borderBottom: '2px solid var(--line)', color: 'var(--ink)' }}>
+                    <th style={{ padding: '8px' }}>Date</th>
+                    <th style={{ padding: '8px' }}>Opp</th>
+                    <th style={{ padding: '8px', textAlign: 'center' }}>PTS</th>
+                    <th style={{ padding: '8px', textAlign: 'center' }}>REB</th>
+                    <th style={{ padding: '8px', textAlign: 'center' }}>AST</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {recentGames.map((game, idx) => {
+                    const formattedDate = game.date
+                      ? new Date(game.date).toLocaleDateString(undefined, {
+                        month: 'numeric',
+                        day: 'numeric'
+                      })
+                      : "N/A";
+
+                    return (
+                      <tr key={idx} style={{ borderBottom: '1px solid var(--border)' }}>
+                        <td style={{ padding: '8px' }}>{formattedDate}</td>
+                        <td style={{ padding: '8px', fontWeight: 600 }}>{game.opponent}</td>
+                        <td style={{ padding: '8px', textAlign: 'center', fontWeight: 'bold' }}>{game.pts}</td>
+                        <td style={{ padding: '8px', textAlign: 'center' }}>{game.reb}</td>
+                        <td style={{ padding: '8px', textAlign: 'center' }}>{game.ast}</td>
+                      </tr>
+                    );
+                  })}
+                  {(() => {
+                    const avgPts = (recentGames.reduce((sum, g) => sum + (Number(g.pts) || 0), 0) / recentGames.length).toFixed(1);
+                    const avgReb = (recentGames.reduce((sum, g) => sum + (Number(g.reb) || 0), 0) / recentGames.length).toFixed(1);
+                    const avgAst = (recentGames.reduce((sum, g) => sum + (Number(g.ast) || 0), 0) / recentGames.length).toFixed(1);
+
+                    let seasonPlayer = null;
+                    const allSeasonRows = [...(seasonPlayers.ucsb?.rows || []), ...(seasonPlayers.opponent?.rows || [])];
+                    seasonPlayer = allSeasonRows.find(p => {
+                      const sn = p["Player"];
+                      if (!sn) return false;
+                      if (sn.includes(",")) {
+                        const [last, first] = sn.split(",").map(s => s.trim());
+                        return `${first} ${last}` === selectedModalPlayer;
+                      }
+                      return sn === selectedModalPlayer;
+                    });
+
+                    const seasonPPG = seasonPlayer ? parseFloat(seasonPlayer["PPG"]) || 0 : null;
+                    const seasonRPG = seasonPlayer ? parseFloat(seasonPlayer["RPG"]) || 0 : null;
+                    const seasonAPG = seasonPlayer ? parseFloat(seasonPlayer["APG"]) || 0 : null;
+
+                    const renderDiff = (avg, season) => {
+                      if (season === null) return null;
+                      const diff = avg - season;
+                      if (Math.abs(diff) < 0.1) return <span style={{ fontSize: '0.75rem', color: 'var(--muted)', marginLeft: '4px' }}>(-)</span>;
+                      const color = diff > 0 ? '#16a34a' : '#dc2626';
+                      const arrow = diff > 0 ? '↑' : '↓';
+                      return (
+                        <span style={{ fontSize: '0.75rem', color, marginLeft: '6px', fontWeight: 'bold', display: 'inline-flex', alignItems: 'center', gap: '2px' }}>
+                          {arrow}{Math.abs(diff).toFixed(1)}
+                        </span>
+                      );
+                    };
+
+                    return (
+                      <tr style={{ backgroundColor: 'rgba(255,255,255,0.05)', borderTop: '2px solid var(--line)' }}>
+                        <td colSpan="2" style={{ padding: '8px', fontWeight: 'bold', textAlign: 'center' }}>5-Game Average:</td>
+                        <td style={{ padding: '8px', textAlign: 'center', fontWeight: 'bold' }}>
+                          <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                            {avgPts} {renderDiff(avgPts, seasonPPG)}
+                          </div>
+                        </td>
+                        <td style={{ padding: '8px', textAlign: 'center', fontWeight: 'bold' }}>
+                          <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                            {avgReb} {renderDiff(avgReb, seasonRPG)}
+                          </div>
+                        </td>
+                        <td style={{ padding: '8px', textAlign: 'center', fontWeight: 'bold' }}>
+                          <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                            {avgAst} {renderDiff(avgAst, seasonAPG)}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })()}
+                </tbody>
+              </table>
+            ) : (
+              <div style={{ textAlign: 'center', padding: '30px', color: 'var(--muted)' }}>
+                No recent game logs found from ESPN.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+}
